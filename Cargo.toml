@@ -4,23 +4,14 @@ version = "0.1.0"
 authors = ["Charlie Ozinga <ozchaz@gmail.com>"]
 
 [dependencies]
+bytes = "0.4"
 futures = "0.1"
 log = "0.4"
 log4rs = "0.8"
 tokio-core = "0.1"
+tokio-codec = "0.1"
 tokio-io = "0.1"
 
 [lib]
 name = "spork"
 path = "src/lib.rs"
-
-# Test programs
-
-[[bin]]
-name = "spork-server"
-path = "src/server.rs"
-
-[[bin]]
-name = "spork-client"
-path = "src/client.rs"
-

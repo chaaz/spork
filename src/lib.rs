@@ -1,10 +1,12 @@
 //! A simple library for a tcp socket (or any other async read/write) that allows input to flow to different
 //! channels.
 
+extern crate bytes;
 extern crate futures;
+extern crate tokio_codec;
 extern crate tokio_core;
 extern crate tokio_io;
-// #[macro_use]
+#[macro_use]
 extern crate log;
 extern crate log4rs;
 
@@ -14,8 +16,10 @@ use futures::unsync::mpsc::{channel, Receiver, Sender};
 use std::io;
 use std::error::Error;
 use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_io::codec::{Decoder, Encoder, FramedRead, FramedWrite};
+use tokio_codec::{Decoder, Encoder, FramedRead, FramedWrite};
 use tokio_io::io::{ReadHalf, WriteHalf};
+
+mod coder;
 
 /// The kind of future used by a spork.
 pub type SporkFuture<I> = Box<Future<Item = I, Error = io::Error>>;
@@ -37,10 +41,7 @@ type WriteFuture<T, E> = Box<Future<Item = SporkWrite<T, E>, Error = (io::Error,
 pub type RespFuture = Box<Future<Item = (), Error = io::Error>>;
 
 /// The underlying write operation, which drives sending data to the socket.
-pub type RwFuture<T, D, E> = Box<Future<
-  Item = (SporkRead<T, D>, SporkWrite<T, E>),
-  Error = (io::Error, (SporkRead<T, D>, Option<SporkWrite<T, E>>))
->>;
+pub type RwFuture = Box<Future<Item = (), Error = io::Error>>;
 
 /// The channels used by a spork, which determines which process handles an incoming message. Any incoming
 /// message is handled immediately and done, or is handled as part of a ongoing conversation which started
@@ -117,7 +118,7 @@ where
   /// - A *responder future*, which continuously loops the `Responder::respond()` function, only completing once
   ///   there are no more conversations from the other side of the connection to respond to. This is also driven
   ///   from the returned read/write future.
-  pub fn process(self) -> (RwFuture<T, D, E>, Chatter<D, E>, RespFuture) {
+  pub fn process(self) -> (RwFuture, Chatter<D, E>, RespFuture) {
     let (name, read, write, s, h, q) = (self.name, self.read, self.write, self.s, self.h, self.q);
     let (here_s, here_r) = channel(2);
     let (there_s, there_r) = channel(2);
@@ -133,24 +134,20 @@ where
     let read_ftr = read_ftr.map(DoneType::Read).map_err(|(e, read)| (e, Some(DoneType::Read(read))));
     let write_ftr = write_ftr.map(DoneType::Write).map_err(|(e, write)| (e, write.map(DoneType::Write)));
 
+    // We can't allow the read to complete if write completes (or vice versa), since it's likely that it will
+    // continue forever, never completing with its error.
     let rw_ftr = read_ftr.select(write_ftr).then(|v| match v {
-      Ok((first, second)) => Either::A(second.then(move |v| match v {
-        Ok(second) => future::ok(joinup(first, second)),
-        Err((e, second)) => future::err((e, joinup_maybe(first, second)))
-      })),
-      Err(((e1, first), second)) => Either::B(second.then(move |v| match v {
-        Ok(second) => future::err((e1, joinup_maybe(second, first))),
-        Err((_e2, second)) => future::err((e1, joinup_maybes(first, second)))
-      }))
+      Ok((_first, _second)) => {
+        debug!("rw_ftr done at OK");
+        future::ok(())
+      },
+      Err(((e1, _first), _second)) => {
+        debug!("rw_ftr done at Err");
+        future::err(e1)
+      }
     });
 
     let resp = q(rspr);
-
-    // let resp_ftr = Box::new(
-    //   sgnl_r
-    //     .map_err(|_| io_err("Lost signal."))
-    //     .for_each(move |val| rspr.respond(val).map(|_| ()))
-    // );
 
     let resp_ftr = future::loop_fn((sgnl_r, resp), move |(sgnl_r, resp)| {
       sgnl_r.into_future().then(move |v| match v {
@@ -163,35 +160,6 @@ where
     });
 
     (Box::new(rw_ftr), cmdr, Box::new(resp_ftr))
-  }
-}
-
-fn joinup<T, D, E>(first: DoneType<T, D, E>, second: DoneType<T, D, E>) -> (SporkRead<T, D>, SporkWrite<T, E>) {
-  match (first, second) {
-    (DoneType::Read(read), DoneType::Write(write)) => (read, write),
-    (DoneType::Write(write), DoneType::Read(read)) => (read, write),
-    _ => panic!("Unexpected type combination")
-  }
-}
-
-fn joinup_maybe<T, D, E>(first: DoneType<T, D, E>, second: Option<DoneType<T, D, E>>)
-    -> (SporkRead<T, D>, Option<SporkWrite<T, E>>) {
-  match (first, second) {
-    (DoneType::Read(read), Some(DoneType::Write(write))) => (read, Some(write)),
-    (DoneType::Read(read), None) => (read, None),
-    (DoneType::Write(write), Some(DoneType::Read(read))) => (read, Some(write)),
-    _ => panic!("Unexpected type combination")
-  }
-}
-
-fn joinup_maybes<T, D, E>(first: Option<DoneType<T, D, E>>, second: Option<DoneType<T, D, E>>)
-    -> (SporkRead<T, D>, Option<SporkWrite<T, E>>) {
-  match (first, second) {
-    (Some(DoneType::Read(read)), Some(DoneType::Write(write))) => (read, Some(write)),
-    (Some(DoneType::Read(read)), None) => (read, None),
-    (Some(DoneType::Write(write)), Some(DoneType::Read(read))) => (read, Some(write)),
-    (None, Some(DoneType::Read(read))) => (read, None),
-    _ => panic!("Unexpected type combination")
   }
 }
 
@@ -255,7 +223,7 @@ where
 
   /// Dispatch or otherwise react to a message received from a server.
   ///
-  /// This sends the message to a channel, where it is responded to appropriately.
+  /// This sends all messages to a channel, where they are responded to appropriately.
   fn dispatch(self) -> ReadFuture<T, D> {
     Box::new(
       future::loop_fn(self, move |dspr| {
@@ -335,6 +303,12 @@ where
   pub fn send(self, msg: E::Item) -> ChatFuture<(), D, E> {
     let (write, read) = (self.write, self.read);
     Box::new(write.send(msg).map_err(|e| io_err(e.description())).map(move |write| ((), Chatter::new(write, read))))
+  }
+
+  /// Gets a clone of the sender, which can be used to send messages to the chat target without consuming this
+  /// chatter.
+  pub fn clone_sender(&self) -> Sender<E::Item> {
+    self.write.clone()
   }
 
   /// Send a message to the server, and return a future that has the response message.
