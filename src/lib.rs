@@ -1,5 +1,126 @@
-//! A simple library for a tcp socket (or any other async read/write) that allows input to flow to different
-//! channels.
+//! A communication protocol that directs messages to ongoing registered conversations. Using a spork lets you
+//! run multiple conversions with the other side of a connection simultaneously, and you can write them all
+//! using async futures-style code.
+//!
+//! ```
+//! # extern crate bytes;
+//! # extern crate futures;
+//! # extern crate spork;
+//! # extern crate tokio_core;
+//! # extern crate tokio_io;
+//! # use bytes::{Buf, BufMut, BytesMut, IntoBuf};
+//! # use futures::{Async, Future, Stream};
+//! # use futures::future::{self, Either};
+//! # use futures::unsync::mpsc::{channel, Sender};
+//! # use spork::*;
+//! # use std::io::{self, Read, Write};
+//! # use std::ops::{Deref, DerefMut};
+//! # use tokio_core::reactor::Core;
+//! # use tokio_core::reactor::Handle;
+//! # use tokio_io::codec::{Decoder, Encoder};
+//! # use tokio_io::{AsyncRead, AsyncWrite};
+//! # struct Msg { msg: String }
+//! # impl Msg {
+//! #   fn new(msg: &str) -> Msg { Msg { msg: msg.into() } }
+//! #   fn text(&self) -> &str { &self.msg }
+//! # }
+//! # struct Enc {}
+//! # impl Enc { fn new() -> Enc { Enc {} } }
+//! # impl Encoder for Enc { 
+//! #   type Item = Msg;
+//! #   type Error = io::Error;
+//! #   fn encode(&mut self, msg: Msg, buf: &mut BytesMut) -> io::Result<()> {
+//! #     buf.put_u32_be(msg.text().len() as u32);
+//! #     buf.extend(msg.text().as_bytes());
+//! #     Ok(())
+//! #   }
+//! # }
+//! # struct Dec { len: Option<u32> }
+//! # impl Dec { fn new() -> Dec { Dec { len: None } } }
+//! # impl Decoder for Dec {
+//! #   type Item = Msg;
+//! #   type Error = io::Error;
+//! #   fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Msg>> {
+//! #     if let Some(len) = self.len {
+//! #       if (buf.len() as u32) < len {
+//! #         Ok(None)
+//! #       } else {
+//! #         Ok(Some(Msg::new(::std::str::from_utf8(&buf.split_to(len as usize).to_vec()).unwrap())))
+//! #       }
+//! #     } else {
+//! #       if buf.len() < 4 {
+//! #         Ok(None)
+//! #       } else {
+//! #         self.len = Some(buf.split_to(4).into_buf().get_u32_be());
+//! #         self.decode(buf)
+//! #       }
+//! #     }
+//! #   }
+//! # }
+//! # struct Rw { b: BytesMut }
+//! # impl Rw { fn new() -> Rw { Rw { b: BytesMut::new() } } }
+//! # impl Read for Rw {
+//! #   fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+//! #     self.b.deref().read(buf)
+//! #   }
+//! # }
+//! # impl AsyncRead for Rw {}
+//! # impl Write for Rw {
+//! #   fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+//! #     self.b.deref_mut().write(buf)
+//! #   }
+//! #   fn flush(&mut self) -> io::Result<()> { Ok(()) }
+//! # }
+//! # impl AsyncWrite for Rw { fn shutdown(&mut self) -> io::Result<Async<()>> { Ok(Async::Ready(())) } }
+//! # fn io_err(desc: &str) -> io::Error { io::Error::new(io::ErrorKind::Other, desc) }
+//! # fn judge_protocol_2(resp: Response<Dec, Enc>) -> impl Future<Item = bool, Error = io::Error> {
+//! #   future::ok(true)
+//! # }
+//! # fn main() {
+//! # let encoder = Enc::new();
+//! # let decoder = Dec::new();
+//! # let core = Core::new().unwrap();
+//! # let handle = core.handle();
+//! # let socket = Rw::new();
+//! let spork = Spork::new("demo".into(), handle.clone(), socket, decoder, encoder, true);
+//! let (chat, incoming_msgs) = spork.process();
+//!
+//! let outgoing_conversation = chat
+//!   .ask(Msg::new("Sending 1"))
+//!   .and_then(|response| {
+//!     match response.message().text() {
+//!       "Got 1" => future::ok(response),
+//!       _ => future::err(io_err("Bad response 1."))
+//!     }
+//!   })
+//!   .and_then(|response| {
+//!     response.ask(Msg::new("Sending 2"))
+//!   })
+//!   .and_then(|response| {
+//!     match response.message().text() {
+//!       "Got 2" => future::ok(()),
+//!       _ => future::err(io_err("Bad response 2."))
+//!     }
+//!   })
+//!   .map(|_| println!("Done with protocol."))
+//!   .map_err(|e| println!("Got error: {:?}.", e));
+//!
+//! let incoming_conversations = incoming_msgs
+//!   .for_each(|response| {
+//!     match response.message().text() {
+//!       "Protocol_1" => Either::A(future::ok(true)),
+//!       "Protocol_2" => Either::B(judge_protocol_2(response)),
+//!       _ => Either::A(future::err(io_err("Unknown protocol.")))
+//!     }
+//!     .map(|v| println!("Judgement: {}", v))
+//!   })
+//!   .map(|_| println!("Done with incoming."))
+//!   .map_err(|e| println!("Got error: {:?}", e));
+//!
+//! handle.spawn(outgoing_conversation);
+//! handle.spawn(incoming_conversations);
+//! # }
+//! ```
 
 extern crate bytes;
 extern crate futures;
@@ -10,165 +131,129 @@ extern crate tokio_io;
 extern crate log;
 extern crate log4rs;
 
-use futures::{Future, Sink, Stream};
-use futures::future::{self, Either, Loop};
-use futures::unsync::mpsc::{channel, Receiver, Sender};
-use std::io;
-use std::error::Error;
-use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_codec::{Decoder, Encoder, FramedRead, FramedWrite};
-use tokio_io::io::{ReadHalf, WriteHalf};
-
 mod coder;
 
-/// The kind of future used by a spork.
-pub type SporkFuture<I> = Box<Future<Item = I, Error = io::Error>>;
+use coder::{Tagged, TaggedDecoder, TaggedEncoder};
+use futures::future::{self, Either, FutureResult, Loop};
+use futures::unsync::mpsc::{channel, Sender};
+use futures::unsync::oneshot;
+use futures::{Future, Sink, Stream};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::error::Error;
+use std::io;
+use std::rc::Rc;
+use tokio_codec::{Decoder, Encoder, FramedRead, FramedWrite};
+use tokio_core::reactor::Handle;
+use tokio_io::io::{ReadHalf, WriteHalf};
+use tokio_io::{AsyncRead, AsyncWrite};
 
-/// The read half of a stream used by a spork.
-pub type SporkRead<T, D> = FramedRead<ReadHalf<T>, D>;
+type SporkRead<T, D> = FramedRead<ReadHalf<T>, TaggedDecoder<D>>;
+type SporkWrite<T, E> = FramedWrite<WriteHalf<T>, TaggedEncoder<E>>;
 
-/// The write half of a stream used by a spork.
-pub type SporkWrite<T, E> = FramedWrite<WriteHalf<T>, E>;
-
-/// The underlying read operation, which drives all dispatch and processing of messages.
-pub type ReadFuture<T, D> = Box<Future<Item = SporkRead<T, D>, Error = (io::Error, SporkRead<T, D>)>>;
-
-/// The underlying write operation, which drives sending data to the socket.
-type WriteFuture<T, E> = Box<Future<Item = SporkWrite<T, E>, Error = (io::Error, Option<SporkWrite<T, E>>)>>;
-
-/// The type of future that drives the responder, which will complete only once the responder has finished
-/// responding to all items.
-pub type RespFuture = Box<Future<Item = (), Error = io::Error>>;
-
-/// The underlying write operation, which drives sending data to the socket.
-pub type RwFuture = Box<Future<Item = (), Error = io::Error>>;
-
-/// The channels used by a spork, which determines which process handles an incoming message. Any incoming
-/// message is handled immediately and done, or is handled as part of a ongoing conversation which started
-/// either on this side of the socket (`Command`) or on the other side (`Respond`).
-pub enum Channel {
-  Immediate,
-  Command,
-  Signal,
-  Respond
-}
-
-/// A managed connection to a socket or other read/write data, which consists of:
-/// - The actual underlying readable/writeable data
-/// - A decoder to convert raw incoming data into objects
-/// - An encoder to convert outgoing objects into data
-/// - A *selector function* to determine which channel a message will be processed on.
-/// - An *immediate function* which handles all immediate message processing.
-/// - A *responder function* which constructs a responer.
-pub struct Spork<T, D, E, S, H, N, Q, R>
+/// A managed connection to a socket or other read/write data.
+pub struct Spork<T, D, E>
 where
   T: AsyncRead + AsyncWrite + Sized,
   D: Decoder + 'static,
-  D::Error: Into<io::Error>,
-  E: Encoder + 'static,
-  S: Fn(&D::Item) -> Channel,
-  H: FnOnce(Sender<E::Item>) -> N + 'static,
-  N: Responder<D> + 'static,
-  Q: FnOnce(Chatter<D, E>) -> R,
-  R: Responder<D>
+  E: Encoder + 'static
 {
   name: String,
+  handle: Handle,
   read: SporkRead<T, D>,
   write: SporkWrite<T, E>,
-  s: S,
-  h: H,
-  q: Q
+  client_role: bool
 }
 
-impl<T, D, E, S, H, N, Q, R> Spork<T, D, E, S, H, N, Q, R>
+impl<T, D, E> Spork<T, D, E>
 where
   T: AsyncRead + AsyncWrite + Sized + 'static,
   D: Decoder + 'static,
   D::Error: Into<io::Error>,
   E: Encoder + 'static,
-  E::Error: Into<io::Error>,
-  S: Fn(&D::Item) -> Channel + 'static,
-  H: FnOnce(Sender<E::Item>) -> N + 'static,
-  N: Responder<D> + 'static,
-  Q: FnOnce(Chatter<D, E>) -> R,
-  R: Responder<D> + 'static
+  E::Error: Into<io::Error>
 {
-  /// Create a new spork which processes data.
-  pub fn new(name: String, t: T, d: D, e: E, s: S, h: H, q: Q) -> Spork<T, D, E, S, H, N, Q, R> {
-    let (r, w) = t.split();
-    let read = FramedRead::new(r, d);
-    let write = FramedWrite::new(w, e);
-    Spork { name, read, write, s, h, q }
+  /// Construct a new spork which processes data from: a name used for debugging purposes; a asynchronous
+  /// core handle; the socket on which messages are received and sent along with the decoder and encoder for
+  /// those messages; and a flag indicating if this spork is operating in a client role.
+  ///
+  /// There are two roles for sporks: the client role and the server role. By convention, the client role is
+  /// assigned to the spork that is on the socket-opening side of the connection, and the server role is
+  /// assigned to the socket-listening side. However, the most important consideration is that sporks on either
+  /// side of a connection aren't assigned to the same role. These roles exist for number messaging stategies:
+  /// they ensure that the two sides of a connection don't generate the same conversation IDs.
+  pub fn new(name: String, handle: Handle, socket: T, decoder: D, encoder: E, client_role: bool) -> Spork<T, D, E> {
+    let (read, write) = socket.split();
+    let read = FramedRead::new(read, TaggedDecoder::new(decoder));
+    let write = FramedWrite::new(write, TaggedEncoder::new(encoder));
+    Spork { name, handle, read, write, client_role }
   }
 
-  /// Process messages coming from the server connection. This method returns three things:
+  /// Process messages coming from the server connection. This method returns:
   ///
-  /// - A *read/write future*, which dispatches and sends messages to and from the underlying socket. This
-  ///   future acts a "pump" for all interactions with the target.
+  /// - A chatter to start conversations from this side of the connection.
+  /// - A stream which generates messages from the other side of the connection. Each such message is the start
+  ///   of a new conversation.
   ///
-  ///   This future should run concurrently with any `send` or `ask` method in the command chatter (also
-  ///   returned). It will successfully complete only when either the read or write communication to the remote
-  ///   socket is closed. When it does complete, it yields:
-  ///   - On success: a read half and write half of the original socket.
-  ///   - On failure: an I/O error for failure, along with the read half and (possible) write half of the
-  ///     socket. You will not receive the write half of the socket if it was dropped by the error.
-  /// - A `Chatter` object that can be used to initiate conversations from this side of the connection. The
-  ///   `send` and `ask` methods of this chat return a future, which will not complete unless the read/write
-  ///   future is also being executed.
-  /// - A *responder future*, which continuously loops the `Responder::respond()` function, only completing once
-  ///   there are no more conversations from the other side of the connection to respond to. This is also driven
-  ///   from the returned read/write future.
-  pub fn process(self) -> (RwFuture, Chatter<D, E>, RespFuture) {
-    let (name, read, write, s, h, q) = (self.name, self.read, self.write, self.s, self.h, self.q);
-    let (here_s, here_r) = channel(2);
-    let (there_s, there_r) = channel(2);
-    let (sgnl_s, sgnl_r) = channel(2);
+  /// See the package documentation or tests for examples of how to use this function.
+  pub fn process(self) -> (Chatter<D, E>, impl Stream<Item = Response<D, E>, Error = io::Error>) {
+    let (name, handle, read, write) = (self.name, self.handle, self.read, self.write);
+    let channels = Channels::new(if self.client_role { 0 } else { 1 });
 
-    let (write_in, write_ftr) = pump(write);
-    let cmdr = Chatter::new(write_in.clone(), here_r);
-    let snpr = h(write_in.clone());
-    let rspr = Chatter::new(write_in, there_r);
-    let dspr = Dispatcher::new(&name, read, s, snpr, here_s, sgnl_s, there_s);
-    let read_ftr = Box::new(dspr.dispatch());
+    let (in_send, in_recv) = channel(2);
+    let (write_in, write_ftr) = out_pump(write);
+    let read_ftr = InPump::new(&name, read, in_send, channels.clone()).pump();
+    let chatter = Chatter::new(write_in, channels);
 
-    let read_ftr = read_ftr.map(DoneType::Read).map_err(|(e, read)| (e, Some(DoneType::Read(read))));
-    let write_ftr = write_ftr.map(DoneType::Write).map_err(|(e, write)| (e, write.map(DoneType::Write)));
+    let chatter_clone = chatter.clone();
+    let incoming_resp =
+      in_recv.map(move |m| Response::new(chatter_clone.clone(), m)).map_err(|_| io_err("Incoming data dropped."));
 
-    // We can't allow the read to complete if write completes (or vice versa), since it's likely that it will
-    // continue forever, never completing with its error.
-    let rw_ftr = read_ftr.select(write_ftr).then(|v| match v {
-      Ok((_first, _second)) => {
-        debug!("rw_ftr done at OK");
-        future::ok(())
-      },
-      Err(((e1, _first), _second)) => {
-        debug!("rw_ftr done at Err");
-        future::err(e1)
-      }
-    });
-
-    let resp = q(rspr);
-
-    let resp_ftr = future::loop_fn((sgnl_r, resp), move |(sgnl_r, resp)| {
-      sgnl_r.into_future().then(move |v| match v {
-        Err(_) => Either::B(future::err(io_err("Lost signal."))),
-        Ok((oval, sgnl_r)) => match oval {
-          None => Either::B(future::ok(Loop::Break(()))),
-          Some(val) => Either::A(resp.respond(val).map(|(_, resp)| Loop::Continue((sgnl_r, resp))))
-        }
-      })
-    });
-
-    (Box::new(rw_ftr), cmdr, Box::new(resp_ftr))
+    handle.spawn(combine_rw(name, read_ftr, write_ftr));
+    (chatter, incoming_resp)
   }
 }
 
-enum DoneType<T, D, E> {
+enum DoneType<T, D, E>
+where
+  D: Decoder + 'static,
+  E: Encoder + 'static
+{
   Read(SporkRead<T, D>),
   Write(SporkWrite<T, E>)
 }
 
-fn pump<T, E>(write: SporkWrite<T, E>) -> (Sender<E::Item>, WriteFuture<T, E>)
+fn combine_rw<T, D, E, R, W>(name: String, read_ftr: R, write_ftr: W) -> impl Future<Item = (), Error = ()>
+where
+  D: Decoder + 'static,
+  E: Encoder + 'static,
+  R: Future<Item = SporkRead<T, D>, Error = (io::Error, SporkRead<T, D>)>,
+  W: Future<Item = SporkWrite<T, E>, Error = (io::Error, Option<SporkWrite<T, E>>)>
+{
+  // Remap the read/write futures to have the same types, so they can be `select`-ed.
+  let read_ftr = read_ftr.map(DoneType::Read).map_err(|(e, read)| (e, Some(DoneType::Read(read))));
+  let write_ftr = write_ftr.map(DoneType::Write).map_err(|(e, write)| (e, write.map(DoneType::Write)));
+
+  // We can't allow the read to complete if write completes (or vice versa), since it's likely that it will
+  // continue forever, never completing with its error.
+
+  let rw_ftr = read_ftr.select(write_ftr).then(move |v| match v {
+    Ok((_first, _second)) => {
+      debug!("Pump for \"{}\" done successfully.", name);
+      future::ok(())
+    }
+    Err(((e1, _first), _second)) => {
+      debug!("Pump for \"{}\" done with error: {:?}.", name, e1);
+      future::err(())
+    }
+  });
+
+  rw_ftr
+}
+
+fn out_pump<T, E>(
+  write: SporkWrite<T, E>
+) -> (Sender<Tagged<E::Item>>, impl Future<Item = SporkWrite<T, E>, Error = (io::Error, Option<SporkWrite<T, E>>)>)
 where
   T: AsyncRead + AsyncWrite + Sized + 'static,
   E: Encoder + 'static,
@@ -176,7 +261,7 @@ where
 {
   let (send, rcv) = channel(2);
 
-  let pump_ftr = Box::new(future::loop_fn((rcv, write), move |(rcv, write)| {
+  let pump_ftr = future::loop_fn((rcv, write), move |(rcv, write)| {
     rcv.into_future().then(move |v| match v {
       Err(_) => Either::B(future::err((io_err("dropped"), Some(write)))),
       Ok((oval, rcv)) => match oval {
@@ -184,93 +269,76 @@ where
         None => Either::B(future::ok(Loop::Break(write)))
       }
     })
-  }));
+  });
 
   (send, pump_ftr)
 }
 
-struct Dispatcher<T, D, S, N>
+struct InPump<T, D>
 where
   T: AsyncRead + 'static,
   D: Decoder + 'static,
-  D::Error: Into<io::Error>,
-  S: Fn(&D::Item) -> Channel + 'static,
-  N: Responder<D> + 'static
+  D::Error: Into<io::Error>
 {
   name: String,
   read: SporkRead<T, D>,
-  s: S,
-  n: N,
-  here: Sender<D::Item>,
-  there: Sender<D::Item>,
-  sgnl: Sender<D::Item>
+  new_key: Sender<Tagged<D::Item>>,
+  channels: Channels<D::Item>
 }
 
-impl<T, D, S, N> Dispatcher<T, D, S, N>
+impl<T, D> InPump<T, D>
 where
   T: AsyncRead + 'static,
   D: Decoder + 'static,
-  D::Error: Into<io::Error>,
-  S: Fn(&D::Item) -> Channel + 'static,
-  N: Responder<D> + 'static
+  D::Error: Into<io::Error>
 {
-  pub fn new(name: &str, read: FramedRead<ReadHalf<T>, D>, s: S, n: N, here: Sender<D::Item>, there: Sender<D::Item>,
-             sgnl: Sender<D::Item>)
-      -> Dispatcher<T, D, S, N> {
-    let name = name.to_string();
-    Dispatcher { name, read, s, n, here, there, sgnl }
+  fn new(
+    name: &str, read: SporkRead<T, D>, new_key: Sender<Tagged<D::Item>>, channels: Channels<D::Item>
+  ) -> InPump<T, D> {
+    InPump { name: name.to_string(), read, new_key, channels }
   }
 
   /// Dispatch or otherwise react to a message received from a server.
   ///
   /// This sends all messages to a channel, where they are responded to appropriately.
-  fn dispatch(self) -> ReadFuture<T, D> {
-    Box::new(
-      future::loop_fn(self, move |dspr| {
-        dspr.into_future().and_then(move |(oreq, dspr)| match oreq {
-          Some(val) => Either::A(dspr.handle_next(val).map(|(_, dspr)| Loop::Continue(dspr))),
-          None => Either::B(future::ok(Loop::Break(dspr)))
-        })
-      }).then(move |v| match v {
-        Ok(dspr) => future::ok(dspr.into_read()),
-        Err((e, read)) => future::err((e, read))
+  fn pump(self) -> impl Future<Item = SporkRead<T, D>, Error = (io::Error, SporkRead<T, D>)> {
+    future::loop_fn(self, move |dspr| {
+      dspr.into_future().and_then(move |(oreq, dspr)| match oreq {
+        Some(val) => Either::A(dspr.handle_next(val).map(|(_, dspr)| Loop::Continue(dspr))),
+        None => Either::B(future::ok(Loop::Break(dspr)))
       })
-    )
+    })
+    .map(|dspr| dspr.into_read())
   }
 
-  /// Just like `Stream.into_future`, but for the dispatcher.
-  fn into_future(self) -> DispFuture<Option<D::Item>, T, D, S, N> {
-    let (name, read, s, n, here, there, sgnl) =
-        (self.name, self.read, self.s, self.n, self.here, self.there, self.sgnl);
+  /// Just like `Stream.into_future`, but for the pump.
+  fn into_future(
+    self
+  ) -> impl Future<Item = (Option<Tagged<D::Item>>, InPump<T, D>), Error = (io::Error, SporkRead<T, D>)> {
+    let (name, read, new_key, channels) = (self.name, self.read, self.new_key, self.channels);
 
-    Box::new(read.into_future().then(move |v| match v {
-      Ok((v, read)) => future::ok((v, Dispatcher::new(&name, read, s, n, here, there, sgnl))),
+    read.into_future().then(move |v| match v {
+      Ok((v, read)) => future::ok((v, InPump::new(&name, read, new_key, channels))),
       Err((e, read)) => future::err((e.into(), read))
-    }))
+    })
   }
 
   /// Handles a single server message by acting directly (such as with `Data` or `Open`), or by routing it to
   /// the appropriate channel.
-  fn handle_next(self, val: D::Item) -> DispFuture<(), T, D, S, N> {
-    let (name, read, s, n, here, there, sgnl) =
-        (self.name, self.read, self.s, self.n, self.here, self.there, self.sgnl);
+  fn handle_next(
+    self, val: Tagged<D::Item>
+  ) -> impl Future<Item = ((), InPump<T, D>), Error = (io::Error, SporkRead<T, D>)> {
+    let (name, read, new_key, channels) = (self.name, self.read, self.new_key, self.channels);
 
-    let channel = s(&val);
+    let tag = val.tag();
+    let channel: Option<Channel<D::Item>> = channels.remove(tag);
     match channel {
-      Channel::Immediate => Box::new(n.respond(val).then(move |r| match r {
-        Ok((_, n)) => future::ok(((), Dispatcher::new(&name, read, s, n, here, there, sgnl))),
-        Err(e) => future::err((e, read))
-      })),
-      Channel::Command => Box::new(here.send(val).then(move |r| match r {
-        Ok(here) => future::ok(((), Dispatcher::new(&name, read, s, n, here, there, sgnl))),
+      Some(channel) => Either::A(channel.send(val).then(move |r| match r {
+        Ok(_) => future::ok(((), InPump::new(&name, read, new_key, channels))),
         Err(e) => future::err((io_err(e.description()), read))
       })),
-      Channel::Signal => Box::new(sgnl.send(val).then(move |r| match r {
-        Ok(sgnl) => future::ok(((), Dispatcher::new(&name, read, s, n, here, there, sgnl))),
-        Err(e) => future::err((io_err(e.description()), read))
-      })),
-      Channel::Respond => Box::new(there.send(val).then(move |r| match r {
-        Ok(there) => future::ok(((), Dispatcher::new(&name, read, s, n, here, there, sgnl))),
+      None => Either::B(new_key.send(val).then(move |r| match r {
+        Ok(new_key) => future::ok(((), InPump::new(&name, read, new_key, channels))),
         Err(e) => future::err((io_err(e.description()), read))
       }))
     }
@@ -279,72 +347,139 @@ where
   fn into_read(self) -> SporkRead<T, D> { self.read }
 }
 
-type DispFuture<I, T, D, S, N> = Box<Future<Item = (I, Dispatcher<T, D, S, N>), Error = (io::Error, SporkRead<T, D>)>>;
-
+/// A simple message sender/receiver that can initiate conversations from this side of a connection.
 pub struct Chatter<D, E>
 where
   D: Decoder + 'static,
   E: Encoder + 'static
 {
-  write: Sender<E::Item>,
-  read: Receiver<D::Item>
+  write: Sender<Tagged<E::Item>>,
+  channels: Channels<D::Item>
+}
+
+impl<D, E> Clone for Chatter<D, E>
+where
+  D: Decoder + 'static,
+  E: Encoder + 'static
+{
+  fn clone(&self) -> Chatter<D, E> { Chatter { write: self.write.clone(), channels: self.channels.clone() } }
 }
 
 impl<D, E> Chatter<D, E>
 where
-  D: Decoder,
-  E: Encoder
+  D: Decoder + 'static,
+  E: Encoder + 'static
 {
-  fn new(write: Sender<E::Item>, read: Receiver<D::Item>) -> Chatter<D, E> {
-    Chatter { write, read }
-  }
+  fn new(write: Sender<Tagged<E::Item>>, channels: Channels<D::Item>) -> Chatter<D, E> { Chatter { write, channels } }
 
   /// Send a message to the server, without expecting a particular response.
-  pub fn send(self, msg: E::Item) -> ChatFuture<(), D, E> {
-    let (write, read) = (self.write, self.read);
-    Box::new(write.send(msg).map_err(|e| io_err(e.description())).map(move |write| ((), Chatter::new(write, read))))
-  }
-
-  /// Gets a clone of the sender, which can be used to send messages to the chat target without consuming this
-  /// chatter.
-  pub fn clone_sender(&self) -> Sender<E::Item> {
-    self.write.clone()
+  pub fn say(&self, msg: E::Item) -> impl Future<Item = (), Error = io::Error> {
+    self.say_keyed(Tagged::new(self.channels.next_key(), msg))
   }
 
   /// Send a message to the server, and return a future that has the response message.
-  pub fn ask(self, msg: E::Item) -> ChatFuture<D::Item, D, E> {
-    let (write, read) = (self.write, self.read);
-    Box::new(write.send(msg).map_err(|e| io_err(e.description())).and_then(move |write| {
-      read.into_future().map_err(|_| io_err("Dropped answer.")).and_then(move |(oval, read)| match oval {
-        Some(val) => future::ok((val, Chatter::new(write, read))),
-        None => future::err(io_err("Expected answer, got nothing."))
-      })
-    }))
+  pub fn ask(&self, msg: E::Item) -> impl Future<Item = Response<D, E>, Error = io::Error> {
+    self.ask_keyed(Tagged::new(self.channels.next_key(), msg))
+  }
+
+  fn say_keyed(&self, msg: Tagged<E::Item>) -> impl Future<Item = (), Error = io::Error> {
+    let write = self.write.clone();
+    write.send(msg).map_err(|e| io_err(e.description())).map(move |_| ())
+  }
+
+  fn ask_keyed(&self, msg: Tagged<E::Item>) -> impl Future<Item = Response<D, E>, Error = io::Error> {
+    let (sender, receiver) = oneshot::channel();
+    let read = receiver.map_err(|e| io_err(&format!("Cancelled while asking: {}", e.description())));
+    self.channels.insert(msg.tag(), sender);
+    let self_clone = self.clone();
+    self.say_keyed(msg).and_then(|_| read).map(move |m| Response::new(self_clone, m))
   }
 }
 
-/// A commander future returns the commander upon success.
-pub type ChatFuture<I, D, E> = Box<Future<Item = (I, Chatter<D, E>), Error = io::Error>>;
-
-/// An object that responds to the start of a conversation initiated by the other side of a data connection.
-pub trait Responder<D>
+/// A message from the other side of a connection, in response to a `Chatter::ask` or `Response::ask` query from
+/// this side. The response can be used to continue sending messages, if required.
+pub struct Response<D, E>
 where
-  D: Decoder
+  D: Decoder + 'static,
+  E: Encoder + 'static
 {
-  fn respond(self, item: D::Item) -> RsprFuture<(), Self>;
+  chatter: Chatter<D, E>,
+  message: Tagged<D::Item>
 }
 
-/// The type of future returned by a responder, which includes the responder itself.
-pub type RsprFuture<I, R> = Box<Future<Item = (I, R), Error = io::Error>>;
+impl<D, E> Response<D, E>
+where
+  D: Decoder + 'static,
+  E: Encoder + 'static
+{
+  fn new(chatter: Chatter<D, E>, message: Tagged<D::Item>) -> Response<D, E> { Response { chatter, message } }
 
-/// A quick and dirty way to create an `io::Error` from a string.
-///
-/// # Examples
-///
-/// ```
-/// # use g2c::common::io_err;
-/// # use std::error::Error;
-/// let err = io_err("test");
-/// assert_eq!(err.description(), "test");
-/// ```
-pub fn io_err(desc: &str) -> io::Error { io::Error::new(io::ErrorKind::Other, desc) }
+  pub fn message(&self) -> &D::Item { &self.message.message() }
+
+  /// Send a message to the server, without expecting a particular response.
+  pub fn say(&self, msg: E::Item) -> impl Future<Item = (), Error = io::Error> {
+    self.chatter.say_keyed(Tagged::new(self.message.tag(), msg))
+  }
+
+  /// Send a message to the server, and return a future that has the response message.
+  pub fn ask(&self, msg: E::Item) -> impl Future<Item = Response<D, E>, Error = io::Error> {
+    self.chatter.ask_keyed(Tagged::new(self.message.tag(), msg))
+  }
+}
+
+struct Channels<T> {
+  next_key: Rc<RefCell<u32>>,
+  channels: Rc<RefCell<HashMap<u32, oneshot::Sender<Tagged<T>>>>>
+}
+
+impl<T> Clone for Channels<T> {
+  fn clone(&self) -> Channels<T> { Channels { next_key: self.next_key.clone(), channels: self.channels.clone() } }
+}
+
+impl<T> Channels<T>
+where
+  T: 'static
+{
+  fn new(next_key: u32) -> Channels<T> {
+    let channels = Rc::new(RefCell::new(HashMap::new()));
+    let next_key = Rc::new(RefCell::new(next_key));
+    Channels { next_key, channels }
+  }
+
+  fn next_key(&self) -> u32 {
+    let key = *self.next_key.borrow();
+    *self.next_key.borrow_mut() += 2;
+    key
+  }
+
+  fn remove(&self, key: u32) -> Option<Channel<T>> { self.channels.borrow_mut().remove(&key).map(Channel::new) }
+
+  fn insert(&self, key: u32, sender: oneshot::Sender<Tagged<T>>) { self.channels.borrow_mut().insert(key, sender); }
+}
+
+struct Channel<T> {
+  sender: oneshot::Sender<Tagged<T>>
+}
+
+impl<T> Channel<T> {
+  fn new(sender: oneshot::Sender<Tagged<T>>) -> Channel<T> { Channel { sender } }
+
+  fn send(self, msg: Tagged<T>) -> FutureResult<(), io::Error> {
+    future::result(self.sender.send(msg).map_err(|_| io_err("Couldn't send.")))
+  }
+}
+
+fn io_err(desc: &str) -> io::Error { io::Error::new(io::ErrorKind::Other, desc) }
+
+/// Unit tests.
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_io_err() {
+    use std::error::Error;
+    let err = io_err("test");
+    assert_eq!(err.description(), "test");
+  }
+}
