@@ -57,6 +57,7 @@ where
 
   fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Tagged<D::Item>>, D::Error> {
     if let Some(tag) = self.tag {
+      println!("With tag {}.", tag);
       match self.d.decode(buf) {
         Ok(Some(v)) => {
           self.tag = None;
@@ -70,6 +71,7 @@ where
         Ok(None)
       } else {
         self.tag = Some(get_u32(buf));
+        println!("Found tag {}.", self.tag.unwrap());
         self.decode(buf)
       }
     }
@@ -79,10 +81,11 @@ where
 /// Get a u32 from a buffer that has one.
 pub fn get_u32(buf: &mut BytesMut) -> u32 { buf.split_to(4).into_buf().get_u32_be() }
 
-/// Unit tests.
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::ops::Deref;
+  use message::*;
 
   #[test]
   fn tagged_tag() {
@@ -107,5 +110,21 @@ mod tests {
     let mut tagged = Tagged::new(3, "Bob".to_string());
     tagged.message_mut().push_str(" is great.");
     assert_eq!(tagged.message().as_str(), "Bob is great.");
+  }
+
+  #[test]
+  fn tagged_encoder_enc() {
+    let mut buf = BytesMut::new();
+    TaggedEncoder::new(Enc::new()).encode(Tagged::new(9, Msg::new("stuff")), &mut buf).unwrap();
+    assert_eq!(buf.take().deref(), b"\x00\x00\x00\x09\x00\x00\x00\x05stuff");
+  }
+
+  #[test]
+  fn tagged_encoder_dec() {
+    let mut bytes = BytesMut::new();
+    bytes.extend_from_slice(b"\x00\x00\x00\x09\x00\x00\x00\x04what");
+    let tagged_msg = TaggedDecoder::new(Dec::new()).decode(&mut bytes).unwrap().unwrap();
+    assert_eq!(tagged_msg.tag(), 9);
+    assert_eq!(tagged_msg.into_message().text(), "what");
   }
 }

@@ -8,70 +8,14 @@
 //! # extern crate spork;
 //! # extern crate tokio_core;
 //! # extern crate tokio_io;
-//! # use bytes::{Buf, BufMut, BytesMut, IntoBuf};
-//! # use futures::{Async, Future, Stream};
+//! # extern crate mock_io;
+//! # use futures::{Future, Stream};
 //! # use futures::future::{self, Either};
-//! # use futures::unsync::mpsc::{channel, Sender};
 //! # use spork::*;
-//! # use std::io::{self, Read, Write};
-//! # use std::ops::{Deref, DerefMut};
-//! # use tokio_core::reactor::Core;
-//! # use tokio_core::reactor::Handle;
-//! # use tokio_io::codec::{Decoder, Encoder};
-//! # use tokio_io::{AsyncRead, AsyncWrite};
-//! # struct Msg { msg: String }
-//! # impl Msg {
-//! #   fn new(msg: &str) -> Msg { Msg { msg: msg.into() } }
-//! #   fn text(&self) -> &str { &self.msg }
-//! # }
-//! # struct Enc {}
-//! # impl Enc { fn new() -> Enc { Enc {} } }
-//! # impl Encoder for Enc { 
-//! #   type Item = Msg;
-//! #   type Error = io::Error;
-//! #   fn encode(&mut self, msg: Msg, buf: &mut BytesMut) -> io::Result<()> {
-//! #     buf.put_u32_be(msg.text().len() as u32);
-//! #     buf.extend(msg.text().as_bytes());
-//! #     Ok(())
-//! #   }
-//! # }
-//! # struct Dec { len: Option<u32> }
-//! # impl Dec { fn new() -> Dec { Dec { len: None } } }
-//! # impl Decoder for Dec {
-//! #   type Item = Msg;
-//! #   type Error = io::Error;
-//! #   fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Msg>> {
-//! #     if let Some(len) = self.len {
-//! #       if (buf.len() as u32) < len {
-//! #         Ok(None)
-//! #       } else {
-//! #         Ok(Some(Msg::new(::std::str::from_utf8(&buf.split_to(len as usize).to_vec()).unwrap())))
-//! #       }
-//! #     } else {
-//! #       if buf.len() < 4 {
-//! #         Ok(None)
-//! #       } else {
-//! #         self.len = Some(buf.split_to(4).into_buf().get_u32_be());
-//! #         self.decode(buf)
-//! #       }
-//! #     }
-//! #   }
-//! # }
-//! # struct Rw { b: BytesMut }
-//! # impl Rw { fn new() -> Rw { Rw { b: BytesMut::new() } } }
-//! # impl Read for Rw {
-//! #   fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-//! #     self.b.deref().read(buf)
-//! #   }
-//! # }
-//! # impl AsyncRead for Rw {}
-//! # impl Write for Rw {
-//! #   fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-//! #     self.b.deref_mut().write(buf)
-//! #   }
-//! #   fn flush(&mut self) -> io::Result<()> { Ok(()) }
-//! # }
-//! # impl AsyncWrite for Rw { fn shutdown(&mut self) -> io::Result<Async<()>> { Ok(Async::Ready(())) } }
+//! # use spork::message::*;
+//! # use std::io;
+//! # use tokio_core::reactor::{Core, Handle};
+//! # use mock_io::Builder;
 //! # fn io_err(desc: &str) -> io::Error { io::Error::new(io::ErrorKind::Other, desc) }
 //! # fn judge_protocol_2(resp: Response<Dec, Enc>) -> impl Future<Item = bool, Error = io::Error> {
 //! #   future::ok(true)
@@ -79,28 +23,28 @@
 //! # fn main() {
 //! # let encoder = Enc::new();
 //! # let decoder = Dec::new();
-//! # let core = Core::new().unwrap();
+//! # let mut core = Core::new().unwrap();
 //! # let handle = core.handle();
-//! # let socket = Rw::new();
-//! let spork = Spork::new("demo".into(), handle.clone(), socket, decoder, encoder, true);
+//! # let socket = Builder::new()
+//! #   .write(b"\x00\x00\x00\x00\x00\x00\x00\x09Sending 1")
+//! #   .read(b"\x00\x00\x00\x00\x00\x00\x00\x05Got 1")
+//! #   .read(b"\x00\x00\x00\x01\x00\x00\x00\x0aProtocol_1")
+//! #   .write(b"\x00\x00\x00\x00\x00\x00\x00\x09Sending 2")
+//! #   .read(b"\x00\x00\x00\x00\x00\x00\x00\x05Got 2")
+//! #   .build();
+//! let spork = Spork::new("demo".into(), handle, socket, decoder, encoder, true);
 //! let (chat, incoming_msgs) = spork.process();
 //!
 //! let outgoing_conversation = chat
 //!   .ask(Msg::new("Sending 1"))
-//!   .and_then(|response| {
-//!     match response.message().text() {
-//!       "Got 1" => future::ok(response),
-//!       _ => future::err(io_err("Bad response 1."))
-//!     }
+//!   .and_then(|response| match response.message().text() {
+//!     "Got 1" => future::ok(response),
+//!     _ => future::err(io_err("Bad response 1."))
 //!   })
-//!   .and_then(|response| {
-//!     response.ask(Msg::new("Sending 2"))
-//!   })
-//!   .and_then(|response| {
-//!     match response.message().text() {
-//!       "Got 2" => future::ok(()),
-//!       _ => future::err(io_err("Bad response 2."))
-//!     }
+//!   .and_then(|response| response.ask(Msg::new("Sending 2")))
+//!   .and_then(|response| match response.message().text() {
+//!     "Got 2" => future::ok(()),
+//!     _ => future::err(io_err(&format!("Bad response 2: {}.", response.message().text())))
 //!   })
 //!   .map(|_| println!("Done with protocol."))
 //!   .map_err(|e| println!("Got error: {:?}.", e));
@@ -110,15 +54,13 @@
 //!     match response.message().text() {
 //!       "Protocol_1" => Either::A(future::ok(true)),
 //!       "Protocol_2" => Either::B(judge_protocol_2(response)),
-//!       _ => Either::A(future::err(io_err("Unknown protocol.")))
+//!       _ => Either::A(future::err(io_err(&format!("Unknown protocol {}.", response.message().text()))))
 //!     }
 //!     .map(|v| println!("Judgement: {}", v))
 //!   })
 //!   .map(|_| println!("Done with incoming."))
 //!   .map_err(|e| println!("Got error: {:?}", e));
-//!
-//! handle.spawn(outgoing_conversation);
-//! handle.spawn(incoming_conversations);
+//! # core.run(outgoing_conversation.join(incoming_conversations).map(|_| ()).map_err(|_| ())).unwrap();
 //! # }
 //! ```
 
@@ -130,8 +72,11 @@ extern crate tokio_io;
 #[macro_use]
 extern crate log;
 extern crate log4rs;
+#[cfg(test)]
+extern crate mock_io;
 
 mod coder;
+pub mod message;
 
 use coder::{Tagged, TaggedDecoder, TaggedEncoder};
 use futures::future::{self, Either, FutureResult, Loop};
@@ -298,20 +243,19 @@ where
     InPump { name: name.to_string(), read, new_key, channels }
   }
 
-  /// Dispatch or otherwise react to a message received from a server.
-  ///
-  /// This sends all messages to a channel, where they are responded to appropriately.
+  /// Listen on our reader, and send each received item to the appropriate channel.
   fn pump(self) -> impl Future<Item = SporkRead<T, D>, Error = (io::Error, SporkRead<T, D>)> {
     future::loop_fn(self, move |dspr| {
-      dspr.into_future().and_then(move |(oreq, dspr)| match oreq {
-        Some(val) => Either::A(dspr.handle_next(val).map(|(_, dspr)| Loop::Continue(dspr))),
-        None => Either::B(future::ok(Loop::Break(dspr)))
+      dspr.into_future().and_then(move |(oreq, dspr)| {
+        match oreq {
+          Some(val) => Either::A(dspr.handle_next(val).map(|(_, dspr)| Loop::Continue(dspr))),
+          None => Either::B(future::ok(Loop::Break(dspr)))
+        }
       })
     })
     .map(|dspr| dspr.into_read())
   }
 
-  /// Just like `Stream.into_future`, but for the pump.
   fn into_future(
     self
   ) -> impl Future<Item = (Option<Tagged<D::Item>>, InPump<T, D>), Error = (io::Error, SporkRead<T, D>)> {
@@ -323,8 +267,6 @@ where
     })
   }
 
-  /// Handles a single server message by acting directly (such as with `Data` or `Open`), or by routing it to
-  /// the appropriate channel.
   fn handle_next(
     self, val: Tagged<D::Item>
   ) -> impl Future<Item = ((), InPump<T, D>), Error = (io::Error, SporkRead<T, D>)> {
@@ -372,27 +314,27 @@ where
 {
   fn new(write: Sender<Tagged<E::Item>>, channels: Channels<D::Item>) -> Chatter<D, E> { Chatter { write, channels } }
 
-  /// Send a message to the server, without expecting a particular response.
-  pub fn say(&self, msg: E::Item) -> impl Future<Item = (), Error = io::Error> {
-    self.say_keyed(Tagged::new(self.channels.next_key(), msg))
-  }
-
   /// Send a message to the server, and return a future that has the response message.
   pub fn ask(&self, msg: E::Item) -> impl Future<Item = Response<D, E>, Error = io::Error> {
-    self.ask_keyed(Tagged::new(self.channels.next_key(), msg))
+    self.ask_tagged(Tagged::new(self.channels.next_key(), msg))
   }
 
-  fn say_keyed(&self, msg: Tagged<E::Item>) -> impl Future<Item = (), Error = io::Error> {
-    let write = self.write.clone();
-    write.send(msg).map_err(|e| io_err(e.description())).map(move |_| ())
+  /// Send a message to the server, without expecting a particular response.
+  pub fn say(&self, msg: E::Item) -> impl Future<Item = (), Error = io::Error> {
+    self.say_tagged(Tagged::new(self.channels.next_key(), msg))
   }
 
-  fn ask_keyed(&self, msg: Tagged<E::Item>) -> impl Future<Item = Response<D, E>, Error = io::Error> {
+  fn ask_tagged(&self, msg: Tagged<E::Item>) -> impl Future<Item = Response<D, E>, Error = io::Error> {
     let (sender, receiver) = oneshot::channel();
     let read = receiver.map_err(|e| io_err(&format!("Cancelled while asking: {}", e.description())));
     self.channels.insert(msg.tag(), sender);
     let self_clone = self.clone();
-    self.say_keyed(msg).and_then(|_| read).map(move |m| Response::new(self_clone, m))
+    self.say_tagged(msg).and_then(|_| read).map(move |m| Response::new(self_clone, m))
+  }
+
+  fn say_tagged(&self, msg: Tagged<E::Item>) -> impl Future<Item = (), Error = io::Error> {
+    let write = self.write.clone();
+    write.send(msg).map_err(|e| io_err(e.description())).map(move |_| ())
   }
 }
 
@@ -418,12 +360,12 @@ where
 
   /// Send a message to the server, without expecting a particular response.
   pub fn say(&self, msg: E::Item) -> impl Future<Item = (), Error = io::Error> {
-    self.chatter.say_keyed(Tagged::new(self.message.tag(), msg))
+    self.chatter.say_tagged(Tagged::new(self.message.tag(), msg))
   }
 
   /// Send a message to the server, and return a future that has the response message.
   pub fn ask(&self, msg: E::Item) -> impl Future<Item = Response<D, E>, Error = io::Error> {
-    self.chatter.ask_keyed(Tagged::new(self.message.tag(), msg))
+    self.chatter.ask_tagged(Tagged::new(self.message.tag(), msg))
   }
 }
 
@@ -471,15 +413,66 @@ impl<T> Channel<T> {
 
 fn io_err(desc: &str) -> io::Error { io::Error::new(io::ErrorKind::Other, desc) }
 
-/// Unit tests.
 #[cfg(test)]
 mod tests {
+  use mock_io::Builder;
   use super::*;
+  use message::*;
+  use tokio_core::reactor::Core;
 
   #[test]
   fn test_io_err() {
     use std::error::Error;
     let err = io_err("test");
     assert_eq!(err.description(), "test");
+  }
+
+  #[test]
+  fn test_chatter_say() {
+    let chatter = setup_chatter();
+    drop(chatter.say(Msg::new("this is great.")));
+    assert_eq!(0, chatter.channels.channels.borrow().len());
+  }
+
+  #[test]
+  fn test_chatter_ask() {
+    let chatter = setup_chatter();
+    drop(chatter.ask(Msg::new("this is great.")));
+    assert_eq!(1, chatter.channels.channels.borrow().len());
+  }
+
+  #[test]
+  fn test_outgoing() {
+    let mut core = Core::new().unwrap();
+    let mocket = Builder::new()
+      .write(b"\x00\x00\x00\x00\x00\x00\x00\x09Sending 1")
+      .read(b"\x00\x00\x00\x00\x00\x00\x00\x05Got 1")
+      .build();
+    let verification = Rc::new(RefCell::new(Vec::new()));
+
+    let client = Spork::new("test".into(), core.handle(), mocket, Dec::new(), Enc::new(), true);
+    let (client_chat, _) = client.process();
+
+    let client_comm = client_chat
+      .ask(Msg::new("Sending 1"))
+      .and_then(|response| {
+        verification.borrow_mut().push(1);
+        match response.message().text() {
+          "Got 1" => { verification.borrow_mut().push(2); future::ok(response) }
+          _ => future::err(io_err("Bad from client."))
+        }
+      })
+      .map(|_| verification.borrow_mut().push(3))
+      .map_err(|e| println!("Got server error: {:?}.", e));
+
+    core.run(client_comm.map(|_| ()).map_err(|_| ())).unwrap();
+    let verification = verification.borrow();
+    assert_eq!(verification.as_slice(), &[1, 2, 3])
+  }
+
+  fn setup_chatter() -> Chatter<Dec, Enc> {
+    let (write, _) = channel(0);
+    let channels = Channels::new(0);
+    Chatter::new(write, channels)
   }
 }

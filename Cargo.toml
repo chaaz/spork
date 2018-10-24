@@ -10,7 +10,11 @@ log = "0.4"
 log4rs = "0.8"
 tokio-core = "0.1"
 tokio-codec = "0.1"
+tokio-timer = "0.1"
 tokio-io = "0.1"
+
+[dev-dependencies]
+mock-io = { git = "https://github.com/chaaz/mock-io" }
 
 [lib]
 name = "spork"
