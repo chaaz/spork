@@ -36,12 +36,12 @@
 //! let (chat, incoming_msgs) = spork.process();
 //!
 //! let outgoing_conversation = chat
-//!   .ask(Msg::new("Sending 1"))
+//!   .ask(Message::new("Sending 1"))
 //!   .and_then(|response| match response.message().text() {
 //!     "Got 1" => future::ok(response),
 //!     _ => future::err(io_err("Bad response 1."))
 //!   })
-//!   .and_then(|response| response.ask(Msg::new("Sending 2")))
+//!   .and_then(|response| response.ask(Message::new("Sending 2")))
 //!   .and_then(|response| match response.message().text() {
 //!     "Got 2" => future::ok(()),
 //!     _ => future::err(io_err(&format!("Bad response 2: {}.", response.message().text())))
@@ -246,11 +246,9 @@ where
   /// Listen on our reader, and send each received item to the appropriate channel.
   fn pump(self) -> impl Future<Item = SporkRead<T, D>, Error = (io::Error, SporkRead<T, D>)> {
     future::loop_fn(self, move |dspr| {
-      dspr.into_future().and_then(move |(oreq, dspr)| {
-        match oreq {
-          Some(val) => Either::A(dspr.handle_next(val).map(|(_, dspr)| Loop::Continue(dspr))),
-          None => Either::B(future::ok(Loop::Break(dspr)))
-        }
+      dspr.into_future().and_then(move |(oreq, dspr)| match oreq {
+        Some(val) => Either::A(dspr.handle_next(val).map(|(_, dspr)| Loop::Continue(dspr))),
+        None => Either::B(future::ok(Loop::Break(dspr)))
       })
     })
     .map(|dspr| dspr.into_read())
@@ -315,26 +313,26 @@ where
   fn new(write: Sender<Tagged<E::Item>>, channels: Channels<D::Item>) -> Chatter<D, E> { Chatter { write, channels } }
 
   /// Send a message to the server, and return a future that has the response message.
-  pub fn ask(&self, msg: E::Item) -> impl Future<Item = Response<D, E>, Error = io::Error> {
-    self.ask_tagged(Tagged::new(self.channels.next_key(), msg))
+  pub fn ask(&self, message: E::Item) -> impl Future<Item = Response<D, E>, Error = io::Error> {
+    self.ask_tagged(Tagged::new(self.channels.next_key(), message))
   }
 
   /// Send a message to the server, without expecting a particular response.
-  pub fn say(&self, msg: E::Item) -> impl Future<Item = (), Error = io::Error> {
-    self.say_tagged(Tagged::new(self.channels.next_key(), msg))
+  pub fn say(&self, message: E::Item) -> impl Future<Item = (), Error = io::Error> {
+    self.say_tagged(Tagged::new(self.channels.next_key(), message))
   }
 
-  fn ask_tagged(&self, msg: Tagged<E::Item>) -> impl Future<Item = Response<D, E>, Error = io::Error> {
+  fn ask_tagged(&self, message: Tagged<E::Item>) -> impl Future<Item = Response<D, E>, Error = io::Error> {
     let (sender, receiver) = oneshot::channel();
     let read = receiver.map_err(|e| io_err(&format!("Cancelled while asking: {}", e.description())));
-    self.channels.insert(msg.tag(), sender);
+    self.channels.insert(message.tag(), sender);
     let self_clone = self.clone();
-    self.say_tagged(msg).and_then(|_| read).map(move |m| Response::new(self_clone, m))
+    self.say_tagged(message).and_then(|_| read).map(move |m| Response::new(self_clone, m))
   }
 
-  fn say_tagged(&self, msg: Tagged<E::Item>) -> impl Future<Item = (), Error = io::Error> {
+  fn say_tagged(&self, message: Tagged<E::Item>) -> impl Future<Item = (), Error = io::Error> {
     let write = self.write.clone();
-    write.send(msg).map_err(|e| io_err(e.description())).map(move |_| ())
+    write.send(message).map_err(|e| io_err(e.description())).map(move |_| ())
   }
 }
 
@@ -359,13 +357,13 @@ where
   pub fn message(&self) -> &D::Item { &self.message.message() }
 
   /// Send a message to the server, without expecting a particular response.
-  pub fn say(&self, msg: E::Item) -> impl Future<Item = (), Error = io::Error> {
-    self.chatter.say_tagged(Tagged::new(self.message.tag(), msg))
+  pub fn say(&self, message: E::Item) -> impl Future<Item = (), Error = io::Error> {
+    self.chatter.say_tagged(Tagged::new(self.message.tag(), message))
   }
 
   /// Send a message to the server, and return a future that has the response message.
-  pub fn ask(&self, msg: E::Item) -> impl Future<Item = Response<D, E>, Error = io::Error> {
-    self.chatter.ask_tagged(Tagged::new(self.message.tag(), msg))
+  pub fn ask(&self, message: E::Item) -> impl Future<Item = Response<D, E>, Error = io::Error> {
+    self.chatter.ask_tagged(Tagged::new(self.message.tag(), message))
   }
 }
 
@@ -406,8 +404,8 @@ struct Channel<T> {
 impl<T> Channel<T> {
   fn new(sender: oneshot::Sender<Tagged<T>>) -> Channel<T> { Channel { sender } }
 
-  fn send(self, msg: Tagged<T>) -> FutureResult<(), io::Error> {
-    future::result(self.sender.send(msg).map_err(|_| io_err("Couldn't send.")))
+  fn send(self, message: Tagged<T>) -> FutureResult<(), io::Error> {
+    future::result(self.sender.send(message).map_err(|_| io_err("Couldn't send.")))
   }
 }
 
@@ -415,9 +413,9 @@ fn io_err(desc: &str) -> io::Error { io::Error::new(io::ErrorKind::Other, desc) 
 
 #[cfg(test)]
 mod tests {
-  use mock_io::Builder;
   use super::*;
   use message::*;
+  use mock_io::Builder;
   use tokio_core::reactor::Core;
 
   #[test]
@@ -430,14 +428,14 @@ mod tests {
   #[test]
   fn test_chatter_say() {
     let chatter = setup_chatter();
-    drop(chatter.say(Msg::new("this is great.")));
+    drop(chatter.say(Message::new("this is great.")));
     assert_eq!(0, chatter.channels.channels.borrow().len());
   }
 
   #[test]
   fn test_chatter_ask() {
     let chatter = setup_chatter();
-    drop(chatter.ask(Msg::new("this is great.")));
+    drop(chatter.ask(Message::new("this is great.")));
     assert_eq!(1, chatter.channels.channels.borrow().len());
   }
 
@@ -454,11 +452,14 @@ mod tests {
     let (client_chat, _) = client.process();
 
     let client_comm = client_chat
-      .ask(Msg::new("Sending 1"))
+      .ask(Message::new("Sending 1"))
       .and_then(|response| {
         verification.borrow_mut().push(1);
         match response.message().text() {
-          "Got 1" => { verification.borrow_mut().push(2); future::ok(response) }
+          "Got 1" => {
+            verification.borrow_mut().push(2);
+            future::ok(response)
+          }
           _ => future::err(io_err("Bad from client."))
         }
       })
@@ -467,7 +468,8 @@ mod tests {
 
     core.run(client_comm.map(|_| ()).map_err(|_| ())).unwrap();
     let verification = verification.borrow();
-    assert_eq!(verification.as_slice(), &[1, 2, 3])
+    assert_eq!(verification.as_slice(), &[1, 2, 3]);
+    assert_eq!(0, client_chat.channels.channels.borrow().len());
   }
 
   fn setup_chatter() -> Chatter<Dec, Enc> {

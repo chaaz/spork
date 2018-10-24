@@ -84,8 +84,8 @@ pub fn get_u32(buf: &mut BytesMut) -> u32 { buf.split_to(4).into_buf().get_u32_b
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::ops::Deref;
   use message::*;
+  use std::ops::Deref;
 
   #[test]
   fn tagged_tag() {
@@ -115,7 +115,7 @@ mod tests {
   #[test]
   fn tagged_encoder_enc() {
     let mut buf = BytesMut::new();
-    TaggedEncoder::new(Enc::new()).encode(Tagged::new(9, Msg::new("stuff")), &mut buf).unwrap();
+    TaggedEncoder::new(Enc::new()).encode(Tagged::new(9, Message::new("stuff")), &mut buf).unwrap();
     assert_eq!(buf.take().deref(), b"\x00\x00\x00\x09\x00\x00\x00\x05stuff");
   }
 

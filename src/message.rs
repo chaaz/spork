@@ -4,13 +4,13 @@ use bytes::{Buf, BufMut, BytesMut, IntoBuf};
 use std::io;
 use tokio_codec::{Decoder, Encoder};
 
-pub struct Msg {
-  msg: String
+pub struct Message {
+  message: String
 }
 
-impl Msg {
-  pub fn new(msg: &str) -> Msg { Msg { msg: msg.into() } }
-  pub fn text(&self) -> &str { &self.msg }
+impl Message {
+  pub fn new(message: &str) -> Message { Message { message: message.into() } }
+  pub fn text(&self) -> &str { &self.message }
 }
 
 pub struct Enc {}
@@ -19,11 +19,11 @@ impl Enc {
 }
 
 impl Encoder for Enc {
-  type Item = Msg;
+  type Item = Message;
   type Error = io::Error;
-  fn encode(&mut self, msg: Msg, buf: &mut BytesMut) -> io::Result<()> {
-    buf.put_u32_be(msg.text().len() as u32);
-    buf.extend(msg.text().as_bytes());
+  fn encode(&mut self, message: Message, buf: &mut BytesMut) -> io::Result<()> {
+    buf.put_u32_be(message.text().len() as u32);
+    buf.extend(message.text().as_bytes());
     Ok(())
   }
 }
@@ -37,15 +37,15 @@ impl Dec {
 }
 
 impl Decoder for Dec {
-  type Item = Msg;
+  type Item = Message;
   type Error = io::Error;
-  fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Msg>> {
+  fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Message>> {
     if let Some(len) = self.len {
       if (buf.len() as u32) < len {
         Ok(None)
       } else {
         self.len = None;
-        Ok(Some(Msg::new(::std::str::from_utf8(&buf.split_to(len as usize).to_vec()).unwrap())))
+        Ok(Some(Message::new(::std::str::from_utf8(&buf.split_to(len as usize).to_vec()).unwrap())))
       }
     } else {
       if buf.len() < 4 {
