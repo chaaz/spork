@@ -4,6 +4,7 @@ use bytes::{Buf, BufMut, BytesMut, IntoBuf};
 use std::io;
 use tokio_codec::{Decoder, Encoder};
 
+/// A simple message that just wraps a `String`.
 pub struct Message {
   message: String
 }
@@ -13,6 +14,7 @@ impl Message {
   pub fn text(&self) -> &str { &self.message }
 }
 
+/// A simple encoder that writes a big-endian u32 byte length, followed by the utf8 bytes of the string.
 pub struct Enc {}
 impl Enc {
   pub fn new() -> Enc { Enc {} }
@@ -22,12 +24,14 @@ impl Encoder for Enc {
   type Item = Message;
   type Error = io::Error;
   fn encode(&mut self, message: Message, buf: &mut BytesMut) -> io::Result<()> {
-    buf.put_u32_be(message.text().len() as u32);
-    buf.extend(message.text().as_bytes());
+    let bytes = message.text().as_bytes();
+    buf.put_u32_be(bytes.len() as u32);
+    buf.extend(bytes);
     Ok(())
   }
 }
 
+/// A simple decoder that reads a big-endian u32 byte length, followed by the utf8 bytes of the string.
 pub struct Dec {
   len: Option<u32>
 }

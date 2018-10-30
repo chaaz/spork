@@ -14,7 +14,7 @@
 //! # use spork::*;
 //! # use spork::message::*;
 //! # use std::io;
-//! # use tokio_core::reactor::{Core, Handle};
+//! # use tokio_core::reactor::Core;
 //! # use mock_io::Builder;
 //! # fn io_err(desc: &str) -> io::Error { io::Error::new(io::ErrorKind::Other, desc) }
 //! # fn judge_protocol_2(resp: Response<Dec, Enc>) -> impl Future<Item = bool, Error = io::Error> {
@@ -24,7 +24,6 @@
 //! # let encoder = Enc::new();
 //! # let decoder = Dec::new();
 //! # let mut core = Core::new().unwrap();
-//! # let handle = core.handle();
 //! # let socket = Builder::new()
 //! #   .write(b"\x00\x00\x00\x00\x00\x00\x00\x09Sending 1")
 //! #   .read(b"\x00\x00\x00\x00\x00\x00\x00\x05Got 1")
@@ -32,8 +31,10 @@
 //! #   .write(b"\x00\x00\x00\x00\x00\x00\x00\x09Sending 2")
 //! #   .read(b"\x00\x00\x00\x00\x00\x00\x00\x05Got 2")
 //! #   .build();
-//! let spork = Spork::new("demo".into(), handle, socket, decoder, encoder, true);
-//! let (chat, incoming_msgs) = spork.process();
+//! let spork = Spork::new("demo".into(), socket, decoder, encoder, true);
+//! let (chat, incoming_msgs, driver) = spork.process();
+//! # let handle = core.handle();
+//! handle.spawn(driver.map_err(|_| ()));
 //!
 //! let outgoing_conversation = chat
 //!   .ask(Message::new("Sending 1"))
@@ -89,7 +90,6 @@ use std::error::Error;
 use std::io;
 use std::rc::Rc;
 use tokio_codec::{Decoder, Encoder, FramedRead, FramedWrite};
-use tokio_core::reactor::Handle;
 use tokio_io::io::{ReadHalf, WriteHalf};
 use tokio_io::{AsyncRead, AsyncWrite};
 
@@ -104,7 +104,6 @@ where
   E: Encoder + 'static
 {
   name: String,
-  handle: Handle,
   read: SporkRead<T, D>,
   write: SporkWrite<T, E>,
   client_role: bool
@@ -118,20 +117,20 @@ where
   E: Encoder + 'static,
   E::Error: Into<io::Error>
 {
-  /// Construct a new spork which processes data from: a name used for debugging purposes; a asynchronous
-  /// core handle; the socket on which messages are received and sent along with the decoder and encoder for
-  /// those messages; and a flag indicating if this spork is operating in a client role.
+  /// Construct a new spork which processes data from: a name used for debugging purposes; the socket on which
+  /// messages are received and sent along with the decoder and encoder for those messages; and a flag
+  /// indicating if this spork is operating in a client role.
   ///
   /// There are two roles for sporks: the client role and the server role. By convention, the client role is
   /// assigned to the spork that is on the socket-opening side of the connection, and the server role is
   /// assigned to the socket-listening side. However, the most important consideration is that sporks on either
   /// side of a connection aren't assigned to the same role. These roles exist for number messaging stategies:
   /// they ensure that the two sides of a connection don't generate the same conversation IDs.
-  pub fn new(name: String, handle: Handle, socket: T, decoder: D, encoder: E, client_role: bool) -> Spork<T, D, E> {
+  pub fn new(name: String, socket: T, decoder: D, encoder: E, client_role: bool) -> Spork<T, D, E> {
     let (read, write) = socket.split();
     let read = FramedRead::new(read, TaggedDecoder::new(decoder));
     let write = FramedWrite::new(write, TaggedEncoder::new(encoder));
-    Spork { name, handle, read, write, client_role }
+    Spork { name, read, write, client_role }
   }
 
   /// Process messages coming from the server connection. This method returns:
@@ -139,10 +138,43 @@ where
   /// - A chatter to start conversations from this side of the connection.
   /// - A stream which generates messages from the other side of the connection. Each such message is the start
   ///   of a new conversation.
+  /// - A "driver" future which manages the internal channels to/from the socket.
+  ///
+  /// The driver future must be constantly `poll`ed to drive the socket communication. If you're not doing
+  /// anything special at the end of the communication, it's easiest to just spawn a new task for it:
+  ///
+  /// ```rust
+  /// # extern crate futures;
+  /// # extern crate spork;
+  /// # extern crate tokio_codec;
+  /// # extern crate tokio_core;
+  /// # extern crate tokio_io;
+  /// # use futures::future::Future;
+  /// # use spork::*;
+  /// # use std::io;
+  /// # use tokio_codec::{Decoder, Encoder};
+  /// # use tokio_core::reactor::*;
+  /// # use tokio_io::{AsyncRead, AsyncWrite};
+  /// # fn do_spawn<T, D, E>(spork: Spork<T, D, E>, handle: Handle)
+  /// # where
+  /// #   T: AsyncRead + AsyncWrite + Sized + 'static,
+  /// #   D: Decoder + 'static,
+  /// #   D::Error: Into<io::Error>,
+  /// #   E: Encoder + 'static,
+  /// #   E::Error: Into<io::Error>
+  /// # {
+  /// let (chat, msgs, driver) = spork.process();
+  /// handle.spawn(driver.map_err(|_| ()));
+  /// # }
+  /// # fn main() {}
+  /// ```
   ///
   /// See the package documentation or tests for examples of how to use this function.
-  pub fn process(self) -> (Chatter<D, E>, impl Stream<Item = Response<D, E>, Error = io::Error>) {
-    let (name, handle, read, write) = (self.name, self.handle, self.read, self.write);
+  pub fn process(
+    self
+  ) -> (Chatter<D, E>, impl Stream<Item = Response<D, E>, Error = io::Error>, impl Future<Item = (), Error = io::Error>)
+  {
+    let (name, read, write) = (self.name, self.read, self.write);
     let channels = Channels::new(if self.client_role { 0 } else { 1 });
 
     let (in_send, in_recv) = channel(2);
@@ -154,8 +186,7 @@ where
     let incoming_resp =
       in_recv.map(move |m| Response::new(chatter_clone.clone(), m)).map_err(|_| io_err("Incoming data dropped."));
 
-    handle.spawn(combine_rw(name, read_ftr, write_ftr));
-    (chatter, incoming_resp)
+    (chatter, incoming_resp, combine_rw(name, read_ftr, write_ftr))
   }
 }
 
@@ -168,7 +199,7 @@ where
   Write(SporkWrite<T, E>)
 }
 
-fn combine_rw<T, D, E, R, W>(name: String, read_ftr: R, write_ftr: W) -> impl Future<Item = (), Error = ()>
+fn combine_rw<T, D, E, R, W>(name: String, read_ftr: R, write_ftr: W) -> impl Future<Item = (), Error = io::Error>
 where
   D: Decoder + 'static,
   E: Encoder + 'static,
@@ -182,18 +213,16 @@ where
   // We can't allow the read to complete if write completes (or vice versa), since it's likely that it will
   // continue forever, never completing with its error.
 
-  let rw_ftr = read_ftr.select(write_ftr).then(move |v| match v {
+  read_ftr.select(write_ftr).then(move |v| match v {
     Ok((_first, _second)) => {
       debug!("Pump for \"{}\" done successfully.", name);
       future::ok(())
     }
-    Err(((e1, _first), _second)) => {
-      debug!("Pump for \"{}\" done with error: {:?}.", name, e1);
-      future::err(())
+    Err(((e, _first), _second)) => {
+      debug!("Pump for \"{}\" done with error: {:?}.", name, e);
+      future::err(e)
     }
-  });
-
-  rw_ftr
+  })
 }
 
 fn out_pump<T, E>(
@@ -337,7 +366,7 @@ where
 }
 
 /// A message from the other side of a connection, in response to a `Chatter::ask` or `Response::ask` query from
-/// this side. The response can be used to continue sending messages, if required.
+/// this side. The response can be used to continue sending messages.
 pub struct Response<D, E>
 where
   D: Decoder + 'static,
@@ -356,6 +385,10 @@ where
 
   pub fn message(&self) -> &D::Item { &self.message.message() }
 
+  pub fn split(self) -> (Responder<D, E>, D::Item) {
+    (Responder::new(self.chatter, self.message.tag()), self.message.into_message())
+  }
+
   /// Send a message to the server, without expecting a particular response.
   pub fn say(&self, message: E::Item) -> impl Future<Item = (), Error = io::Error> {
     self.chatter.say_tagged(Tagged::new(self.message.tag(), message))
@@ -364,6 +397,50 @@ where
   /// Send a message to the server, and return a future that has the response message.
   pub fn ask(&self, message: E::Item) -> impl Future<Item = Response<D, E>, Error = io::Error> {
     self.chatter.ask_tagged(Tagged::new(self.message.tag(), message))
+  }
+}
+
+/// The responder component of a response to a `Chatter::ask` or `Responder::ask` query. The responder doesn't
+/// contain the answering message, but can be used to continue sending messages.
+pub struct Responder<D, E>
+where
+  D: Decoder + 'static,
+  E: Encoder + 'static
+{
+  chatter: Chatter<D, E>,
+  tag: u32
+}
+
+impl<D, E> Clone for Responder<D, E>
+where
+  D: Decoder + 'static,
+  E: Encoder + 'static
+{
+  fn clone(&self) -> Responder<D, E> {
+    Responder { chatter: self.chatter.clone(), tag: self.tag }
+  }
+}
+
+impl<D, E> Responder<D, E>
+where
+  D: Decoder + 'static,
+  E: Encoder + 'static
+{
+  fn new(chatter: Chatter<D, E>, tag: u32) -> Responder<D, E> { Responder { chatter, tag } }
+
+  /// Send a message to the server, without expecting a particular response.
+  pub fn say(&self, message: E::Item) -> impl Future<Item = (), Error = io::Error> {
+    self.chatter.say_tagged(Tagged::new(self.tag, message))
+  }
+
+  /// Send a message to the server, and return a future that has the response message.
+  pub fn ask(&self, message: E::Item) -> impl Future<Item = Response<D, E>, Error = io::Error> {
+    self.chatter.ask_tagged(Tagged::new(self.tag, message))
+  }
+
+  /// Create a new response coming back from the server, based on this responder. See `Response::split`.
+  pub fn join(self, message: D::Item) -> Response<D, E> {
+    Response::new(self.chatter, Tagged::new(self.tag, message))
   }
 }
 
@@ -448,8 +525,9 @@ mod tests {
       .build();
     let verification = Rc::new(RefCell::new(Vec::new()));
 
-    let client = Spork::new("test".into(), core.handle(), mocket, Dec::new(), Enc::new(), true);
-    let (client_chat, _) = client.process();
+    let client = Spork::new("test".into(), mocket, Dec::new(), Enc::new(), true);
+    let (client_chat, _, driver) = client.process();
+    core.handle().spawn(driver.map_err(|_| ()));
 
     let client_comm = client_chat
       .ask(Message::new("Sending 1"))
