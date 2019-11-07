@@ -117,9 +117,9 @@ where
   E: Encoder + 'static,
   E::Error: Into<io::Error>
 {
-  /// Construct a new spork which processes data from: a name used for debugging purposes; the socket on which
-  /// messages are received and sent along with the decoder and encoder for those messages; and a flag
-  /// indicating if this spork is operating in a client role.
+  /// Construct a new spork which processes data. It's built from a name used for debugging purposes; the socket
+  /// on which messages are received and sent; the decoder and encoder for those messages; and a flag indicating
+  /// if this spork is operating in the client role.
   ///
   /// There are two roles for sporks: the client role and the server role. By convention, the client role is
   /// assigned to the spork that is on the socket-opening side of the connection, and the server role is
@@ -139,6 +139,8 @@ where
   /// - A stream which generates messages from the other side of the connection. Each such message is the start
   ///   of a new conversation.
   /// - A "driver" future which manages the internal channels to/from the socket.
+  ///
+  /// # Examples
   ///
   /// The driver future must be constantly `poll`ed to drive the socket communication. If you're not doing
   /// anything special at the end of the communication, it's easiest to just spawn a new task for it:
@@ -164,7 +166,7 @@ where
   /// #   E::Error: Into<io::Error>
   /// # {
   /// let (chat, msgs, driver) = spork.process();
-  /// handle.spawn(driver.map_err(|_| ()));
+  /// handle.spawn(driver.map_err(|e| eprintln!("{:?}", e)));
   /// # }
   /// # fn main() {}
   /// ```
@@ -341,14 +343,14 @@ where
 {
   fn new(write: Sender<Tagged<E::Item>>, channels: Channels<D::Item>) -> Chatter<D, E> { Chatter { write, channels } }
 
-  /// Send a message to the server, and return a future that has the response message.
-  pub fn ask(&self, message: E::Item) -> impl Future<Item = Response<D, E>, Error = io::Error> {
-    self.ask_tagged(Tagged::new(self.channels.next_key(), message))
-  }
-
   /// Send a message to the server, without expecting a particular response.
   pub fn say(&self, message: E::Item) -> impl Future<Item = (), Error = io::Error> {
     self.say_tagged(Tagged::new(self.channels.next_key(), message))
+  }
+
+  /// Send a message to the server, and return a future that has the response message.
+  pub fn ask(&self, message: E::Item) -> impl Future<Item = Response<D, E>, Error = io::Error> {
+    self.ask_tagged(Tagged::new(self.channels.next_key(), message))
   }
 
   fn ask_tagged(&self, message: Tagged<E::Item>) -> impl Future<Item = Response<D, E>, Error = io::Error> {
@@ -416,9 +418,7 @@ where
   D: Decoder + 'static,
   E: Encoder + 'static
 {
-  fn clone(&self) -> Responder<D, E> {
-    Responder { chatter: self.chatter.clone(), tag: self.tag }
-  }
+  fn clone(&self) -> Responder<D, E> { Responder { chatter: self.chatter.clone(), tag: self.tag } }
 }
 
 impl<D, E> Responder<D, E>
@@ -439,9 +439,7 @@ where
   }
 
   /// Create a new response coming back from the server, based on this responder. See `Response::split`.
-  pub fn join(self, message: D::Item) -> Response<D, E> {
-    Response::new(self.chatter, Tagged::new(self.tag, message))
-  }
+  pub fn join(self, message: D::Item) -> Response<D, E> { Response::new(self.chatter, Tagged::new(self.tag, message)) }
 }
 
 struct Channels<T> {
@@ -548,6 +546,39 @@ mod tests {
     let verification = verification.borrow();
     assert_eq!(verification.as_slice(), &[1, 2, 3]);
     assert_eq!(0, client_chat.channels.channels.borrow().len());
+  }
+
+  #[test]
+  fn test_incoming() {
+    let mut core = Core::new().unwrap();
+    let mocket = Builder::new()
+      .read(b"\x00\x00\x00\x00\x00\x00\x00\x08Server 1")
+      .write(b"\x00\x00\x00\x00\x00\x00\x00\x04Ok 1")
+      .build();
+    let verification = Rc::new(RefCell::new(Vec::new()));
+
+    let server = Spork::new("test".into(), mocket, Dec::new(), Enc::new(), false);
+    let (server_chat, server_comm, driver) = server.process();
+    core.handle().spawn(driver.map_err(|_| ()));
+
+    let server_comm = server_comm
+      .and_then(|msg| {
+        verification.borrow_mut().push(1);
+        match msg.message().text() {
+          "Server 1" => {
+            verification.borrow_mut().push(2);
+            Either::A(msg.say(Message::new("Ok 1")))
+          }
+          _ => Either::B(future::err(io_err("Bad msg from server.")))
+        }
+      })
+      .map(|_| verification.borrow_mut().push(3))
+      .map_err(|e| println!("Got client error: {:?}.", e));
+
+    core.run(server_comm.into_future().map(|_| ()).map_err(|_| ())).unwrap();
+    let verification = verification.borrow();
+    assert_eq!(verification.as_slice(), &[1, 2, 3]);
+    assert_eq!(0, server_chat.channels.channels.borrow().len());
   }
 
   fn setup_chatter() -> Chatter<Dec, Enc> {

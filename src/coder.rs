@@ -15,7 +15,6 @@ impl<M> Tagged<M> {
   pub fn tag(&self) -> u32 { self.tag }
   pub fn into_message(self) -> M { self.message }
   pub fn message(&self) -> &M { &self.message }
-  pub fn message_mut(&mut self) -> &mut M { &mut self.message }
 }
 
 pub struct TaggedEncoder<E> {
@@ -84,7 +83,7 @@ pub fn get_u32(buf: &mut BytesMut) -> u32 { buf.split_to(4).into_buf().get_u32_b
 #[cfg(test)]
 mod tests {
   use super::*;
-  use message::*;
+  use crate::message::*;
   use std::ops::Deref;
 
   #[test]
@@ -103,13 +102,6 @@ mod tests {
   fn tagged_message() {
     let tagged = Tagged::new(3, "Bob".to_string());
     assert_eq!(tagged.message().as_str(), "Bob");
-  }
-
-  #[test]
-  fn tagged_message_mut() {
-    let mut tagged = Tagged::new(3, "Bob".to_string());
-    tagged.message_mut().push_str(" is great.");
-    assert_eq!(tagged.message().as_str(), "Bob is great.");
   }
 
   #[test]
