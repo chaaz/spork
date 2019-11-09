@@ -43,7 +43,7 @@
 //!   }
 //!   let response2 = response1.ask("Sending 2").await?;
 //!   if response2.message().text() != "Got 2" {
-//!     return Err(io_err("Bad response 1."));
+//!     return Err(io_err("Bad response 2."));
 //!   }
 //!   Ok(println!("Done with protocol."))
 //! };
@@ -82,6 +82,7 @@ use tokio::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 type SporkRead<T, D> = Compat01As03<FramedRead<Compat<ReadHalf<T>>, TaggedDecoder<D>>>;
 type SporkWrite<T, E> =
   Compat01As03Sink<FramedWrite<Compat<WriteHalf<T>>, TaggedEncoder<E>>, Tagged<<E as Encoder>::Item>>;
+type Er = std::io::Error;
 
 /// A managed connection to a socket or other read/write data.
 pub struct Spork<T, D, E>
@@ -100,9 +101,9 @@ impl<T, D, E> Spork<T, D, E>
 where
   T: AsyncRead + AsyncWrite + Sized + 'static,
   D: Decoder + 'static,
-  D::Error: Into<io::Error>,
+  D::Error: Into<Er>,
   E: Encoder + 'static,
-  E::Error: Into<io::Error>
+  E::Error: Into<Er>
 {
   /// Construct a new spork which processes data. It's built from a name used for debugging purposes; the socket
   /// on which messages are received and sent; the decoder and encoder for those messages; and a flag indicating
@@ -167,8 +168,7 @@ where
   /// See the package documentation or tests for examples of how to use this function.
   pub fn process(
     self
-  ) -> (Chatter<D, E>, impl Stream<Item = Result<Response<D, E>, io::Error>>, impl Future<Output = Result<(), io::Error>>)
-  {
+  ) -> (Chatter<D, E>, impl Stream<Item = Result<Response<D, E>, Er>>, impl Future<Output = Result<(), Er>>) {
     let (name, read, write) = (self.name, self.read, self.write);
     let channels = Channels::new(if self.client_role { 0 } else { 1 });
 
@@ -184,10 +184,10 @@ where
   }
 }
 
-async fn combine_rw<R, W>(name: String, read_ftr: R, write_ftr: W) -> Result<(), io::Error>
+async fn combine_rw<R, W>(name: String, read_ftr: R, write_ftr: W) -> Result<(), Er>
 where
-  R: Future<Output = Result<(), io::Error>> + Unpin,
-  W: Future<Output = Result<(), io::Error>> + Unpin
+  R: Future<Output = Result<(), Er>> + Unpin,
+  W: Future<Output = Result<(), Er>> + Unpin
 {
   // We can't allow the read to complete if write completes (or vice versa), since it's likely that it will
   // continue forever, never completing with its error.
@@ -205,21 +205,21 @@ where
   }
 }
 
-fn out_pump<T, E>(write: SporkWrite<T, E>) -> (Sender<Tagged<E::Item>>, impl Future<Output = Result<(), io::Error>>)
+fn out_pump<T, E>(write: SporkWrite<T, E>) -> (Sender<Tagged<E::Item>>, impl Future<Output = Result<(), Er>>)
 where
   T: AsyncRead + AsyncWrite + Sized + 'static,
   E: Encoder + 'static,
-  E::Error: Into<io::Error>
+  E::Error: Into<Er>
 {
   let (send, rcv) = channel(2);
   (send, out_loop(write, rcv))
 }
 
-async fn out_loop<T, E>(mut write: SporkWrite<T, E>, mut rcv: Receiver<Tagged<E::Item>>) -> Result<(), io::Error>
+async fn out_loop<T, E>(mut write: SporkWrite<T, E>, mut rcv: Receiver<Tagged<E::Item>>) -> Result<(), Er>
 where
   T: AsyncRead + AsyncWrite + Sized + 'static,
   E: Encoder + 'static,
-  E::Error: Into<io::Error>
+  E::Error: Into<Er>
 {
   while let Some(val) = rcv.next().await {
     write.send(val).await.map_err(|e| e.into())?
@@ -230,11 +230,11 @@ where
 /// Listen on our reader, and send each received item to the appropriate channel.
 async fn in_pump<T, D>(
   mut read: SporkRead<T, D>, mut new_key: Sender<Tagged<D::Item>>, mut channels: Channels<D::Item>
-) -> Result<(), io::Error>
+) -> Result<(), Er>
 where
   T: AsyncRead + 'static,
   D: Decoder + 'static,
-  D::Error: Into<io::Error>
+  D::Error: Into<Er>
 {
   while let Some(val) = read.next().await {
     handle_next::<D>(&mut new_key, &mut channels, val.map_err(|e| e.into())?).await?
@@ -245,10 +245,10 @@ where
 
 async fn handle_next<D>(
   new_key: &mut Sender<Tagged<D::Item>>, channels: &mut Channels<D::Item>, val: Tagged<D::Item>
-) -> Result<(), io::Error>
+) -> Result<(), Er>
 where
   D: Decoder + 'static,
-  D::Error: Into<io::Error>
+  D::Error: Into<Er>
 {
   let tag = val.tag();
   let channel: Option<Channel<D::Item>> = channels.remove(tag);
@@ -285,18 +285,18 @@ where
   fn new(write: Sender<Tagged<E::Item>>, channels: Channels<D::Item>) -> Chatter<D, E> { Chatter { write, channels } }
 
   /// Send a message to the server, without expecting a particular response.
-  pub fn say<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<(), io::Error>> {
+  pub fn say<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<(), Er>> {
     let next_key = self.channels.next_key();
     self.say_tagged(Tagged::new(next_key, message.into()))
   }
 
   /// Send a message to the server, and return a future that has the response message.
-  pub fn ask<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<Response<D, E>, io::Error>> {
+  pub fn ask<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<Response<D, E>, Er>> {
     let next_key = self.channels.next_key();
     self.ask_tagged(Tagged::new(next_key, message.into()))
   }
 
-  fn ask_tagged(self, message: Tagged<E::Item>) -> impl Future<Output = Result<Response<D, E>, io::Error>> {
+  fn ask_tagged(self, message: Tagged<E::Item>) -> impl Future<Output = Result<Response<D, E>, Er>> {
     let (sender, receiver) = oneshot::channel();
     let read = receiver.map(|v| v.map_err(|e| io_err(&format!("Cancelled while asking: {}", e.description()))));
     self.channels.insert(message.tag(), sender);
@@ -304,7 +304,7 @@ where
     self.say_tagged(message).and_then(|_| read).map(move |v| v.map(move |m| Response::new(self_clone, m)))
   }
 
-  fn say_tagged(mut self, message: Tagged<E::Item>) -> impl Future<Output = Result<(), io::Error>> {
+  fn say_tagged(mut self, message: Tagged<E::Item>) -> impl Future<Output = Result<(), Er>> {
     async move { self.write.send(message).await.map_err(|e| io_err(e.description())) }
   }
 }
@@ -334,13 +334,13 @@ where
   }
 
   /// Send a message to the server, without expecting a particular response.
-  pub fn say<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<(), io::Error>> {
+  pub fn say<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<(), Er>> {
     let tag = self.message.tag();
     self.chatter.say_tagged(Tagged::new(tag, message.into()))
   }
 
   /// Send a message to the server, and return a future that has the response message.
-  pub fn ask<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<Response<D, E>, io::Error>> {
+  pub fn ask<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<Response<D, E>, Er>> {
     let tag = self.message.tag();
     self.chatter.ask_tagged(Tagged::new(tag, message.into()))
   }
@@ -373,13 +373,13 @@ where
   fn new(chatter: Chatter<D, E>, tag: u32) -> Responder<D, E> { Responder { chatter, tag } }
 
   /// Send a message to the server, without expecting a particular response.
-  pub fn say<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<(), io::Error>> {
+  pub fn say<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<(), Er>> {
     let tag = self.tag;
     self.chatter.say_tagged(Tagged::new(tag, message.into()))
   }
 
   /// Send a message to the server, and return a future that has the response message.
-  pub fn ask<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<Response<D, E>, io::Error>> {
+  pub fn ask<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<Response<D, E>, Er>> {
     let tag = self.tag;
     self.chatter.ask_tagged(Tagged::new(tag, message.into()))
   }
@@ -425,12 +425,12 @@ struct Channel<T> {
 impl<T> Channel<T> {
   fn new(sender: oneshot::Sender<Tagged<T>>) -> Channel<T> { Channel { sender } }
 
-  fn send(self, message: Tagged<T>) -> Ready<Result<(), io::Error>> {
+  fn send(self, message: Tagged<T>) -> Ready<Result<(), Er>> {
     future::ready(self.sender.send(message).map_err(|_| io_err("Couldn't send.")))
   }
 }
 
-fn io_err(desc: &str) -> io::Error { io::Error::new(io::ErrorKind::Other, desc) }
+fn io_err(desc: &str) -> Er { Er::new(io::ErrorKind::Other, desc) }
 
 #[cfg(test)]
 mod tests {
