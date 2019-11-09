@@ -1,7 +1,7 @@
 //! The encoder/decoder instrumentation for a spork object.
 
 use bytes::{Buf, BufMut, BytesMut, IntoBuf};
-use tokio_codec::{Decoder, Encoder};
+use tokio::codec::{Decoder, Encoder};
 
 /// A tagged message, which wraps an original message.
 pub struct Tagged<M> {
@@ -56,7 +56,6 @@ where
 
   fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Tagged<D::Item>>, D::Error> {
     if let Some(tag) = self.tag {
-      println!("With tag {}.", tag);
       match self.d.decode(buf) {
         Ok(Some(v)) => {
           self.tag = None;
@@ -70,7 +69,6 @@ where
         Ok(None)
       } else {
         self.tag = Some(get_u32(buf));
-        println!("Found tag {}.", self.tag.unwrap());
         self.decode(buf)
       }
     }

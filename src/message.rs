@@ -2,7 +2,7 @@
 
 use bytes::{Buf, BufMut, BytesMut, IntoBuf};
 use std::io;
-use tokio_codec::{Decoder, Encoder};
+use tokio::codec::{Decoder, Encoder};
 
 /// A simple message that just wraps a `String`.
 pub struct Message {
@@ -12,6 +12,10 @@ pub struct Message {
 impl Message {
   pub fn new(message: &str) -> Message { Message { message: message.into() } }
   pub fn text(&self) -> &str { &self.message }
+}
+
+impl From<&str> for Message {
+  fn from(v: &str) -> Message { Message::new(v) }
 }
 
 /// A simple encoder that writes a big-endian u32 byte length, followed by the utf8 bytes of the string.
