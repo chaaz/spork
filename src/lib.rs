@@ -33,7 +33,7 @@
 //! #   .build()
 //! #   .compat();
 //! let spork = Spork::new("demo".into(), socket, decoder, encoder, true);
-//! let (outgoing_msgs, incoming_msgs, driver) = spork.process();
+//! let (mut outgoing_msgs, incoming_msgs, driver, _) = spork.process();
 //! pool.spawner().spawn(driver.unwrap_or_else(|e| println!("Error: {:?}", e))).unwrap();
 //!
 //! let outgoing = async move {
@@ -66,8 +66,9 @@ pub mod message;
 use crate::coder::{Tagged, TaggedDecoder, TaggedEncoder};
 use futures::channel::mpsc::{channel, Receiver, Sender};
 use futures::channel::oneshot;
+use futures::channel::oneshot::{Receiver as OneReceiver, Sender as OneSender};
 use futures::compat::{Compat, Compat01As03, Compat01As03Sink, Sink01CompatExt, Stream01CompatExt};
-use futures::future::{self, try_select, Future, FutureExt, Ready, TryFutureExt};
+use futures::future::{self, try_select, Either, Future, FutureExt, Ready, TryFutureExt};
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use futures::sink::SinkExt;
 use futures::stream::{Stream, StreamExt};
@@ -127,6 +128,7 @@ where
   /// - A stream which generates messages from the other side of the connection. Each such message is the start
   ///   of a new conversation.
   /// - A "driver" future which manages the internal channels to/from the socket.
+  /// - An "interrupter", which can be used to interrupt the driver by sending it ().
   ///
   /// # Examples
   ///
@@ -159,7 +161,7 @@ where
   /// #   E::Item: std::marker::Send
   /// # {
   /// let mut pool = LocalPool::new();
-  /// let (chat, msgs, driver) = spork.process();
+  /// let (chat, msgs, driver, _) = spork.process();
   /// pool.spawner().spawn(driver.unwrap_or_else(|e| println!("Error: {:?}", e))).unwrap();
   /// # }
   /// # fn main() {}
@@ -168,7 +170,12 @@ where
   /// See the package documentation or tests for examples of how to use this function.
   pub fn process(
     self
-  ) -> (Chatter<D, E>, impl Stream<Item = Result<Response<D, E>, Er>>, impl Future<Output = Result<(), Er>>) {
+  ) -> (
+    Chatter<D, E>,
+    impl Stream<Item = Result<Response<D, E>, Er>>,
+    impl Future<Output = Result<(), Er>>,
+    OneSender<()>
+  ) {
     let (name, read, write) = (self.name, self.read, self.write);
     let channels = Channels::new(if self.client_role { 0 } else { 1 });
 
@@ -176,15 +183,16 @@ where
     let (write_in, write_ftr) = out_pump(write);
     let read_ftr = in_pump(read, in_send, channels.clone());
     let chatter = Chatter::new(write_in, channels);
+    let (intr_send, intr_recv) = futures::channel::oneshot::channel();
 
     let chatter_clone = chatter.clone();
     let incoming_resp = in_recv.map(move |m| Ok(Response::new(chatter_clone.clone(), m)));
 
-    (chatter, incoming_resp, combine_rw(name, Box::pin(read_ftr), Box::pin(write_ftr)))
+    (chatter, incoming_resp, combine_rw(name, Box::pin(read_ftr), Box::pin(write_ftr), intr_recv), intr_send)
   }
 }
 
-async fn combine_rw<R, W>(name: String, read_ftr: R, write_ftr: W) -> Result<(), Er>
+async fn combine_rw<R, W>(name: String, read_ftr: R, write_ftr: W, intr: OneReceiver<()>) -> Result<(), Er>
 where
   R: Future<Output = Result<(), Er>> + Unpin,
   W: Future<Output = Result<(), Er>> + Unpin
@@ -192,16 +200,24 @@ where
   // We can't allow the read to complete if write completes (or vice versa), since it's likely that it will
   // continue forever, never completing with its error.
 
-  match try_select(read_ftr, write_ftr).await {
-    Ok(_) => {
+  let double = try_select(read_ftr, write_ftr)
+    .map_ok(|_| {
       debug!("Pump for \"{}\" done successfully.", name);
-      Ok(())
-    }
-    Err(e) => {
+      ()
+    })
+    .map_err(|e| {
       let e = e.factor_first().0;
       debug!("Pump for \"{}\" done with error: {:?}.", name, e);
-      Err(e)
+      e
+    });
+
+  match try_select(intr, double).await {
+    Ok(_) => Ok(()),
+    Err(Either::Left((_canceled, double))) => {
+      // If our user just dropped the interrupter, they clearly don't care about interrupting.
+      double.await
     }
+    Err(Either::Right((e, _intr))) => Err(e)
   }
 }
 
@@ -285,18 +301,30 @@ where
   fn new(write: Sender<Tagged<E::Item>>, channels: Channels<D::Item>) -> Chatter<D, E> { Chatter { write, channels } }
 
   /// Send a message to the server, without expecting a particular response.
-  pub fn say<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<(), Er>> {
+  pub fn say<M: Into<E::Item>>(&mut self, message: M) -> impl Future<Output = Result<(), Er>> + '_ {
     let next_key = self.channels.next_key();
     self.say_tagged(Tagged::new(next_key, message.into()))
   }
 
   /// Send a message to the server, and return a future that has the response message.
-  pub fn ask<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<Response<D, E>, Er>> {
+  pub fn ask<M: Into<E::Item>>(&mut self, message: M) -> impl Future<Output = Result<Response<D, E>, Er>> + '_ {
     let next_key = self.channels.next_key();
     self.ask_tagged(Tagged::new(next_key, message.into()))
   }
 
-  fn ask_tagged(self, message: Tagged<E::Item>) -> impl Future<Output = Result<Response<D, E>, Er>> {
+  /// Send a message to the server, without expecting a particular response.
+  pub fn into_say<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<(), Er>> {
+    let next_key = self.channels.next_key();
+    self.into_say_tagged(Tagged::new(next_key, message.into()))
+  }
+
+  /// Send a message to the server, and return a future that has the response message.
+  pub fn into_ask<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<Response<D, E>, Er>> {
+    let next_key = self.channels.next_key();
+    self.into_ask_tagged(Tagged::new(next_key, message.into()))
+  }
+
+  fn ask_tagged(&mut self, message: Tagged<E::Item>) -> impl Future<Output = Result<Response<D, E>, Er>> + '_ {
     let (sender, receiver) = oneshot::channel();
     let read = receiver.map(|v| v.map_err(|e| io_err(&format!("Cancelled while asking: {}", e.description()))));
     self.channels.insert(message.tag(), sender);
@@ -304,7 +332,19 @@ where
     self.say_tagged(message).and_then(|_| read).map(move |v| v.map(move |m| Response::new(self_clone, m)))
   }
 
-  fn say_tagged(mut self, message: Tagged<E::Item>) -> impl Future<Output = Result<(), Er>> {
+  async fn say_tagged(&mut self, message: Tagged<E::Item>) -> Result<(), Er> {
+    self.write.send(message).await.map_err(|e| io_err(e.description()))
+  }
+
+  fn into_ask_tagged(self, message: Tagged<E::Item>) -> impl Future<Output = Result<Response<D, E>, Er>> {
+    let (sender, receiver) = oneshot::channel();
+    let read = receiver.map(|v| v.map_err(|e| io_err(&format!("Cancelled while asking: {}", e.description()))));
+    self.channels.insert(message.tag(), sender);
+    let self_clone = self.clone();
+    self.into_say_tagged(message).and_then(|_| read).map(move |v| v.map(move |m| Response::new(self_clone, m)))
+  }
+
+  fn into_say_tagged(mut self, message: Tagged<E::Item>) -> impl Future<Output = Result<(), Er>> {
     async move { self.write.send(message).await.map_err(|e| io_err(e.description())) }
   }
 }
@@ -336,13 +376,13 @@ where
   /// Send a message to the server, without expecting a particular response.
   pub fn say<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<(), Er>> {
     let tag = self.message.tag();
-    self.chatter.say_tagged(Tagged::new(tag, message.into()))
+    self.chatter.into_say_tagged(Tagged::new(tag, message.into()))
   }
 
   /// Send a message to the server, and return a future that has the response message.
   pub fn ask<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<Response<D, E>, Er>> {
     let tag = self.message.tag();
-    self.chatter.ask_tagged(Tagged::new(tag, message.into()))
+    self.chatter.into_ask_tagged(Tagged::new(tag, message.into()))
   }
 }
 
@@ -372,16 +412,19 @@ where
 {
   fn new(chatter: Chatter<D, E>, tag: u32) -> Responder<D, E> { Responder { chatter, tag } }
 
+  /// Get the chatter that originated this response, so that further conversations can be had.
+  pub fn chatter(&self) -> Chatter<D, E> { self.chatter.clone() }
+
   /// Send a message to the server, without expecting a particular response.
   pub fn say<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<(), Er>> {
     let tag = self.tag;
-    self.chatter.say_tagged(Tagged::new(tag, message.into()))
+    self.chatter.into_say_tagged(Tagged::new(tag, message.into()))
   }
 
   /// Send a message to the server, and return a future that has the response message.
   pub fn ask<M: Into<E::Item>>(self, message: M) -> impl Future<Output = Result<Response<D, E>, Er>> {
     let tag = self.tag;
-    self.chatter.ask_tagged(Tagged::new(tag, message.into()))
+    self.chatter.into_ask_tagged(Tagged::new(tag, message.into()))
   }
 
   /// Create a new response coming back from the server, based on this responder. See `Response::split`.
@@ -452,7 +495,7 @@ mod tests {
 
   #[test]
   fn test_chatter_say() {
-    let chatter = setup_chatter();
+    let mut chatter = setup_chatter();
     let channels = chatter.channels.channels.clone();
     drop(chatter.say("Sending without expecting response."));
     assert_eq!(0, channels.lock().unwrap().len());
@@ -460,7 +503,7 @@ mod tests {
 
   #[test]
   fn test_chatter_ask() {
-    let chatter = setup_chatter();
+    let mut chatter = setup_chatter();
     let channels = chatter.channels.channels.clone();
     drop(chatter.ask("What is the response?"));
     assert_eq!(1, channels.lock().unwrap().len());
@@ -477,7 +520,7 @@ mod tests {
     let verification = Arc::new(Mutex::new(Vec::new()));
 
     let client = Spork::new("test".into(), mocket, Dec::new(), Enc::new(), true);
-    let (client_chat, _, driver) = client.process();
+    let (mut client_chat, _, driver, _) = client.process();
     pool.spawner().spawn(driver.unwrap_or_else(|e| println!("Error: {:?}", e))).unwrap();
 
     let channels = client_chat.channels.channels.clone();
@@ -512,7 +555,7 @@ mod tests {
     let verification = Arc::new(Mutex::new(Vec::new()));
 
     let client = Spork::new("test".into(), mocket, Dec::new(), Enc::new(), true);
-    let (client_chat, _, driver) = client.process();
+    let (mut client_chat, _, driver, _) = client.process();
     pool.spawner().spawn(driver.unwrap_or_else(|e| println!("Error: {:?}", e))).unwrap();
 
     let channels = client_chat.channels.channels.clone();
@@ -544,7 +587,7 @@ mod tests {
     let verification = Arc::new(Mutex::new(Vec::new()));
 
     let server = Spork::new("test".into(), mocket, Dec::new(), Enc::new(), false);
-    let (server_chat, server_comm, driver) = server.process();
+    let (server_chat, server_comm, driver, _) = server.process();
     pool.spawner().spawn(driver.unwrap_or_else(|e| println!("Error: {:?}", e))).unwrap();
 
     let server_comm = server_comm
