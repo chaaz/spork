@@ -33,6 +33,9 @@ where
   type Error = E::Error;
 
   fn encode(&mut self, i: Tagged<E::Item>, buf: &mut BytesMut) -> Result<(), E::Error> {
+    if buf.remaining_mut() < 4 {
+      buf.reserve(4);
+    }
     buf.put_u32_be(i.tag());
     self.e.encode(i.into_message(), buf)
   }

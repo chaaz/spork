@@ -29,6 +29,9 @@ impl Encoder for Enc {
   type Error = io::Error;
   fn encode(&mut self, message: Message, buf: &mut BytesMut) -> io::Result<()> {
     let bytes = message.text().as_bytes();
+    if buf.remaining_mut() < 4 {
+      buf.reserve(4);
+    }
     buf.put_u32_be(bytes.len() as u32);
     buf.extend(bytes);
     Ok(())
