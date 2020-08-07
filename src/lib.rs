@@ -20,7 +20,6 @@
 //! # fn handle_protocol_2(resp: Response<Dec, Enc>) -> impl Future<Output = Result<bool, io::Error>> {
 //! #   future::ok(true)
 //! # }
-//! # fn main() {
 //! # let encoder = Enc::new();
 //! # let decoder = Dec::new();
 //! # let mut pool = LocalPool::new();
@@ -57,7 +56,6 @@
 //!   .map_ok(|v| println!("Judgement: {}", v))
 //! });
 //! # pool.run_until(try_join(outgoing, incoming)).unwrap();
-//! # }
 //! ```
 
 mod coder;
@@ -75,7 +73,6 @@ use futures::stream::{Stream, StreamExt};
 use log::debug;
 use std::boxed::Box;
 use std::collections::HashMap;
-use std::error::Error;
 use std::io;
 use std::sync::{Arc, Mutex};
 use tokio::codec::{Decoder, Encoder, FramedRead, FramedWrite};
@@ -203,7 +200,6 @@ where
   let double = try_select(read_ftr, write_ftr)
     .map_ok(|_| {
       debug!("Pump for \"{}\" done successfully.", name);
-      ()
     })
     .map_err(|e| {
       let e = e.factor_first().0;
@@ -270,8 +266,8 @@ where
   let channel: Option<Channel<D::Item>> = channels.remove(tag);
 
   match channel {
-    Some(channel) => channel.send(val).await.map_err(|e| io_err(e.description())),
-    None => new_key.send(val).await.map_err(|e| io_err(e.description()))
+    Some(channel) => channel.send(val).await.map_err(|e| io_err(&e.to_string())),
+    None => new_key.send(val).await.map_err(|e| io_err(&e.to_string()))
   }
 }
 
@@ -326,26 +322,26 @@ where
 
   fn ask_tagged(&mut self, message: Tagged<E::Item>) -> impl Future<Output = Result<Response<D, E>, Er>> + '_ {
     let (sender, receiver) = oneshot::channel();
-    let read = receiver.map(|v| v.map_err(|e| io_err(&format!("Cancelled while asking: {}", e.description()))));
+    let read = receiver.map(|v| v.map_err(|e| io_err(&format!("Cancelled while asking: {}", e.to_string()))));
     self.channels.insert(message.tag(), sender);
     let self_clone = self.clone();
     self.say_tagged(message).and_then(|_| read).map(move |v| v.map(move |m| Response::new(self_clone, m)))
   }
 
   async fn say_tagged(&mut self, message: Tagged<E::Item>) -> Result<(), Er> {
-    self.write.send(message).await.map_err(|e| io_err(e.description()))
+    self.write.send(message).await.map_err(|e| io_err(&e.to_string()))
   }
 
   fn into_ask_tagged(self, message: Tagged<E::Item>) -> impl Future<Output = Result<Response<D, E>, Er>> {
     let (sender, receiver) = oneshot::channel();
-    let read = receiver.map(|v| v.map_err(|e| io_err(&format!("Cancelled while asking: {}", e.description()))));
+    let read = receiver.map(|v| v.map_err(|e| io_err(&format!("Cancelled while asking: {}", e.to_string()))));
     self.channels.insert(message.tag(), sender);
     let self_clone = self.clone();
     self.into_say_tagged(message).and_then(|_| read).map(move |v| v.map(move |m| Response::new(self_clone, m)))
   }
 
   fn into_say_tagged(mut self, message: Tagged<E::Item>) -> impl Future<Output = Result<(), Er>> {
-    async move { self.write.send(message).await.map_err(|e| io_err(e.description())) }
+    async move { self.write.send(message).await.map_err(|e| io_err(&e.to_string())) }
   }
 }
 
@@ -488,9 +484,8 @@ mod tests {
 
   #[test]
   fn test_io_err() {
-    use std::error::Error;
     let err = io_err("Test error.");
-    assert_eq!(err.description(), "Test error.");
+    assert_eq!(err.to_string(), "Test error.");
   }
 
   #[test]

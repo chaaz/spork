@@ -67,13 +67,11 @@ where
         Ok(None) => Ok(None),
         Err(e) => Err(e)
       }
+    } else if buf.len() < 4 {
+      Ok(None)
     } else {
-      if buf.len() < 4 {
-        Ok(None)
-      } else {
-        self.tag = Some(get_u32(buf));
-        self.decode(buf)
-      }
+      self.tag = Some(get_u32(buf));
+      self.decode(buf)
     }
   }
 }

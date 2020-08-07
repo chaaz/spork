@@ -24,6 +24,10 @@ impl Enc {
   pub fn new() -> Enc { Enc {} }
 }
 
+impl Default for Enc {
+  fn default() -> Enc { Enc::new() }
+}
+
 impl Encoder for Enc {
   type Item = Message;
   type Error = io::Error;
@@ -47,6 +51,10 @@ impl Dec {
   pub fn new() -> Dec { Dec { len: None } }
 }
 
+impl Default for Dec {
+  fn default() -> Dec { Dec::new() }
+}
+
 impl Decoder for Dec {
   type Item = Message;
   type Error = io::Error;
@@ -58,13 +66,11 @@ impl Decoder for Dec {
         self.len = None;
         Ok(Some(Message::new(::std::str::from_utf8(&buf.split_to(len as usize).to_vec()).unwrap())))
       }
+    } else if buf.len() < 4 {
+      Ok(None)
     } else {
-      if buf.len() < 4 {
-        Ok(None)
-      } else {
-        self.len = Some(buf.split_to(4).into_buf().get_u32_be());
-        self.decode(buf)
-      }
+      self.len = Some(buf.split_to(4).into_buf().get_u32_be());
+      self.decode(buf)
     }
   }
 }
