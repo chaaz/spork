@@ -1,18 +1,25 @@
 [package]
-edition = "2018"
 name = "spork"
-version = "0.3.1"
+version = "0.4.0"
 authors = ["Charlie Ozinga <ozchaz@gmail.com>"]
+edition = "2018"
 
 [dependencies]
-bytes = "0.4"
-futures = { version = "0.3", features = ["compat", "io-compat"] }
+bytes = "0.5"
+error-chain = "0.12"
+futures = "0.3"
 log = "0.4"
-log4rs = "0.8"
-tokio = "0.1"
+
+[dependencies.tokio]
+version = "0.2"
+features = ["tcp"]
+
+[dependencies.tokio-util]
+version = "0.3"
+features = ["codec", "compat"]
 
 [dev-dependencies]
-mock-io = { git = "https://github.com/chaaz/mock-io" }
+tokio-test = "0.2"
 
 [lib]
 name = "spork"

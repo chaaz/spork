@@ -1,8 +1,8 @@
 //! A simple message format, along with an associated encoder and decoder.
 
-use bytes::{Buf, BufMut, BytesMut, IntoBuf};
-use std::io;
-use tokio::codec::{Decoder, Encoder};
+use crate::errors::{Error, Result};
+use bytes::{Buf, BufMut, BytesMut};
+use tokio_util::codec::{Decoder, Encoder};
 
 /// A simple message that just wraps a `String`.
 pub struct Message {
@@ -28,15 +28,15 @@ impl Default for Enc {
   fn default() -> Enc { Enc::new() }
 }
 
-impl Encoder for Enc {
-  type Item = Message;
-  type Error = io::Error;
-  fn encode(&mut self, message: Message, buf: &mut BytesMut) -> io::Result<()> {
+impl Encoder<Message> for Enc {
+  type Error = Error;
+
+  fn encode(&mut self, message: Message, buf: &mut BytesMut) -> Result<()> {
     let bytes = message.text().as_bytes();
     if buf.remaining_mut() < 4 {
       buf.reserve(4);
     }
-    buf.put_u32_be(bytes.len() as u32);
+    buf.put_u32(bytes.len() as u32);
     buf.extend(bytes);
     Ok(())
   }
@@ -57,8 +57,9 @@ impl Default for Dec {
 
 impl Decoder for Dec {
   type Item = Message;
-  type Error = io::Error;
-  fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Message>> {
+  type Error = Error;
+
+  fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Message>> {
     if let Some(len) = self.len {
       if (buf.len() as u32) < len {
         Ok(None)
@@ -69,7 +70,7 @@ impl Decoder for Dec {
     } else if buf.len() < 4 {
       Ok(None)
     } else {
-      self.len = Some(buf.split_to(4).into_buf().get_u32_be());
+      self.len = Some(buf.split_to(4).get_u32());
       self.decode(buf)
     }
   }
