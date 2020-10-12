@@ -23,7 +23,7 @@ where
   E: Encoder<EI>
 {
   e: E,
-  _ei: PhantomData<*const EI>
+  _ei: PhantomData<fn() -> EI>
 }
 
 impl<E, EI> TaggedEncoder<E, EI>

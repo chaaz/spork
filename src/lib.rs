@@ -97,8 +97,9 @@ where
   T: AsyncRead + AsyncWrite + Sized + 'static,
   D: Decoder + 'static,
   D::Error: Into<Error>,
+  D::Item: Send + 'static,
   E: Encoder<EI> + 'static,
-  EI: 'static,
+  EI: 'static + Send,
   E::Error: Into<Error>
 {
   /// Construct a new spork which processes data. It's built from a name used for debugging purposes; the socket
@@ -238,7 +239,7 @@ where
 /// Listen on our reader, and send each received item to the appropriate channel.
 async fn in_pump<S, DI, E>(mut read: S, mut new_key: Sender<Tagged<DI>>, mut channels: Channels<DI>) -> Result<()>
 where
-  DI: 'static,
+  DI: 'static + Send,
   S: Stream<Item = std::result::Result<Tagged<DI>, E>> + Unpin,
   E: Into<Error>
 {
