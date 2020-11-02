@@ -74,7 +74,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
+use tokio::time::{timeout, Duration};
 
+const ASK_TIMEOUT_SECS: u64 = 5;
 type SporkRead<T, D> = FramedRead<Compat<ReadHalf<T>>, TaggedDecoder<D>>;
 type SporkWrite<T, E, EI> = FramedWrite<Compat<WriteHalf<T>>, TaggedEncoder<E, EI>>;
 type Er = Error;
@@ -84,7 +86,8 @@ pub struct Spork<T, D, E, EI>
 where
   T: AsyncRead + AsyncWrite + Sized,
   D: Decoder + 'static,
-  E: Encoder<EI> + 'static
+  E: Encoder<EI> + 'static + Send,
+  EI: 'static + Send
 {
   name: String,
   read: SporkRead<T, D>,
@@ -98,7 +101,7 @@ where
   D: Decoder + 'static,
   D::Error: Into<Error>,
   D::Item: Send + 'static,
-  E: Encoder<EI> + 'static,
+  E: Encoder<EI> + 'static + Send,
   EI: 'static + Send,
   E::Error: Into<Error>
 {
@@ -165,8 +168,8 @@ where
   pub fn process(
     self
   ) -> (
-    Chatter<D, EI>,
-    impl Stream<Item = Result<Response<D, EI>>>,
+    Chatter<D::Item, EI>,
+    impl Stream<Item = Result<Response<D::Item, EI>>>,
     impl Future<Output = Result<()>>,
     oneshot::Sender<()>
   ) {
@@ -217,8 +220,9 @@ where
 fn out_pump<T, E, EI>(write: SporkWrite<T, E, EI>) -> (Sender<Tagged<EI>>, impl Future<Output = Result<()>>)
 where
   T: AsyncRead + AsyncWrite + Sized + 'static,
-  E: Encoder<EI> + 'static,
-  E::Error: Into<Er>
+  E: Encoder<EI> + 'static + Send,
+  E::Error: Into<Er>,
+  EI: 'static + Send
 {
   let (send, rcv) = channel(2);
   (send, out_loop(write, rcv))
@@ -227,8 +231,9 @@ where
 async fn out_loop<T, E, EI>(mut write: SporkWrite<T, E, EI>, mut rcv: Receiver<Tagged<EI>>) -> Result<()>
 where
   T: AsyncRead + AsyncWrite + Sized + 'static,
-  E: Encoder<EI> + 'static,
-  E::Error: Into<Er>
+  E: Encoder<EI> + 'static + Send,
+  E::Error: Into<Er>,
+  EI: 'static + Send
 {
   while let Some(val) = rcv.next().await {
     write.send(val).await.map_err(|e| e.into())?
@@ -263,27 +268,21 @@ async fn handle_next<DI: 'static>(
 }
 
 /// A simple message sender/receiver that can initiate conversations from this side of a connection.
-pub struct Chatter<D, EI>
-where
-  D: Decoder + 'static
-{
+pub struct Chatter<DI, EI> {
   write: Sender<Tagged<EI>>,
-  channels: Channels<D::Item>
+  channels: Channels<DI>
 }
 
-impl<D, EI> Clone for Chatter<D, EI>
-where
-  D: Decoder + 'static
-{
-  fn clone(&self) -> Chatter<D, EI> { Chatter { write: self.write.clone(), channels: self.channels.clone() } }
+impl<DI, EI> Clone for Chatter<DI, EI> {
+  fn clone(&self) -> Chatter<DI, EI> { Chatter { write: self.write.clone(), channels: self.channels.clone() } }
 }
 
-impl<D, EI> Chatter<D, EI>
+impl<DI, EI> Chatter<DI, EI>
 where
   EI: 'static,
-  D: Decoder + 'static
+  DI: 'static
 {
-  fn new(write: Sender<Tagged<EI>>, channels: Channels<D::Item>) -> Chatter<D, EI> { Chatter { write, channels } }
+  fn new(write: Sender<Tagged<EI>>, channels: Channels<DI>) -> Chatter<DI, EI> { Chatter { write, channels } }
 
   /// Send a message to the server, without expecting a particular response.
   pub fn say<M: Into<EI>>(&mut self, message: M) -> impl Future<Output = Result<()>> + '_ {
@@ -292,7 +291,7 @@ where
   }
 
   /// Send a message to the server, and return a future that has the response message.
-  pub fn ask<M: Into<EI>>(&mut self, message: M) -> impl Future<Output = Result<Response<D, EI>>> + '_ {
+  pub fn ask<M: Into<EI>>(&mut self, message: M) -> impl Future<Output = Result<Response<DI, EI>>> + '_ {
     let next_key = self.channels.next_key();
     self.ask_tagged(Tagged::new(next_key, message.into()))
   }
@@ -304,56 +303,69 @@ where
   }
 
   /// Send a message to the server, and return a future that has the response message.
-  pub fn into_ask<M: Into<EI>>(self, message: M) -> impl Future<Output = Result<Response<D, EI>>> {
+  pub fn into_ask<M: Into<EI>>(self, message: M) -> impl Future<Output = Result<Response<DI, EI>>> {
     let next_key = self.channels.next_key();
     self.into_ask_tagged(Tagged::new(next_key, message.into()))
   }
 
-  fn ask_tagged(&mut self, message: Tagged<EI>) -> impl Future<Output = Result<Response<D, EI>>> + '_ {
+  fn ask_tagged(&mut self, message: Tagged<EI>) -> impl Future<Output = Result<Response<DI, EI>>> + '_ {
     let (sender, receiver) = oneshot::channel();
-    let read = receiver.map(|v| v.map_err(|e| bad!("Cancelled while asking: {:?}", e)));
+    let read = timeout(
+      Duration::from_secs(ASK_TIMEOUT_SECS),
+      receiver.map(|v| v.map_err(|e| bad!("Cancelled while asking: {:?}", e)))
+    );
     self.channels.insert(message.tag(), sender);
     let self_clone = self.clone();
-    self.say_tagged(message).and_then(|_| read).map(move |v| v.map(move |m| Response::new(self_clone, m)))
+
+    async move {
+      self.say_tagged(message).await?;
+      let m = read.await??;
+      Ok(Response::new(self_clone, m))
+    }
   }
 
   async fn say_tagged(&mut self, message: Tagged<EI>) -> Result<()> {
-    self.write.send(message).await.map_err(|e| e.into())
+    Ok(self.write.send(message).await?)
   }
 
-  fn into_ask_tagged(self, message: Tagged<EI>) -> impl Future<Output = Result<Response<D, EI>>> {
+  fn into_ask_tagged(self, message: Tagged<EI>) -> impl Future<Output = Result<Response<DI, EI>>> {
     let (sender, receiver) = oneshot::channel();
-    let read = receiver.map(|v| v.map_err(|e| bad!("Cancelled while asking: {:?}", e)));
+    let read = timeout(
+      Duration::from_secs(ASK_TIMEOUT_SECS),
+      receiver.map(|v| v.map_err(|e| bad!("Cancelled while asking: {:?}", e)))
+    );
     self.channels.insert(message.tag(), sender);
     let self_clone = self.clone();
-    self.into_say_tagged(message).and_then(|_| read).map(move |v| v.map(move |m| Response::new(self_clone, m)))
+
+    async move {
+      self.into_say_tagged(message).await?;
+      let m = read.await??;
+      Ok(Response::new(self_clone, m))
+    }
   }
 
   async fn into_say_tagged(mut self, message: Tagged<EI>) -> Result<()> {
-    self.write.send(message).await.map_err(|e| e.into())
+    Ok(self.write.send(message).await?)
   }
 }
 
 /// A message from the other side of a connection, in response to a `Chatter::ask` or `Response::ask` query from
 /// this side. The response can be used to continue sending messages.
-pub struct Response<D, EI>
-where
-  D: Decoder + 'static
-{
-  chatter: Chatter<D, EI>,
-  message: Tagged<D::Item>
+pub struct Response<DI, EI> {
+  chatter: Chatter<DI, EI>,
+  message: Tagged<DI>
 }
 
-impl<D, EI> Response<D, EI>
+impl<DI, EI> Response<DI, EI>
 where
-  D: Decoder + 'static,
+  DI: 'static,
   EI: 'static
 {
-  fn new(chatter: Chatter<D, EI>, message: Tagged<D::Item>) -> Response<D, EI> { Response { chatter, message } }
+  fn new(chatter: Chatter<DI, EI>, message: Tagged<DI>) -> Response<DI, EI> { Response { chatter, message } }
 
-  pub fn message(&self) -> &D::Item { &self.message.message() }
+  pub fn message(&self) -> &DI { &self.message.message() }
 
-  pub fn split(self) -> (Responder<D, EI>, D::Item) {
+  pub fn split(self) -> (Responder<DI, EI>, DI) {
     (Responder::new(self.chatter, self.message.tag()), self.message.into_message())
   }
 
@@ -364,7 +376,7 @@ where
   }
 
   /// Send a message to the server, and return a future that has the response message.
-  pub fn ask<M: Into<EI>>(self, message: M) -> impl Future<Output = Result<Response<D, EI>>> {
+  pub fn ask<M: Into<EI>>(self, message: M) -> impl Future<Output = Result<Response<DI, EI>>> {
     let tag = self.message.tag();
     self.chatter.into_ask_tagged(Tagged::new(tag, message.into()))
   }
@@ -372,30 +384,32 @@ where
 
 /// The responder component of a response to a `Chatter::ask` or `Responder::ask` query. The responder doesn't
 /// contain the answering message, but can be used to continue sending messages.
-pub struct Responder<D, EI>
+pub struct Responder<DI, EI>
 where
-  D: Decoder + 'static
+  DI: 'static,
+  EI: 'static
 {
-  chatter: Chatter<D, EI>,
+  chatter: Chatter<DI, EI>,
   tag: u32
 }
 
-impl<D, EI> Clone for Responder<D, EI>
+impl<DI, EI> Clone for Responder<DI, EI>
 where
-  D: Decoder + 'static
-{
-  fn clone(&self) -> Responder<D, EI> { Responder { chatter: self.chatter.clone(), tag: self.tag } }
-}
-
-impl<D, EI> Responder<D, EI>
-where
-  D: Decoder + 'static,
+  DI: 'static,
   EI: 'static
 {
-  fn new(chatter: Chatter<D, EI>, tag: u32) -> Responder<D, EI> { Responder { chatter, tag } }
+  fn clone(&self) -> Responder<DI, EI> { Responder { chatter: self.chatter.clone(), tag: self.tag } }
+}
+
+impl<DI, EI> Responder<DI, EI>
+where
+  DI: 'static,
+  EI: 'static
+{
+  fn new(chatter: Chatter<DI, EI>, tag: u32) -> Responder<DI, EI> { Responder { chatter, tag } }
 
   /// Get the chatter that originated this response, so that further conversations can be had.
-  pub fn chatter(&self) -> Chatter<D, EI> { self.chatter.clone() }
+  pub fn chatter(&self) -> Chatter<DI, EI> { self.chatter.clone() }
 
   /// Send a message to the server, without expecting a particular response.
   pub fn say<M: Into<EI>>(self, message: M) -> impl Future<Output = Result<()>> {
@@ -404,13 +418,13 @@ where
   }
 
   /// Send a message to the server, and return a future that has the response message.
-  pub fn ask<M: Into<EI>>(self, message: M) -> impl Future<Output = Result<Response<D, EI>>> {
+  pub fn ask<M: Into<EI>>(self, message: M) -> impl Future<Output = Result<Response<DI, EI>>> {
     let tag = self.tag;
     self.chatter.into_ask_tagged(Tagged::new(tag, message.into()))
   }
 
   /// Create a new response coming back from the server, based on this responder. See `Response::split`.
-  pub fn join(self, message: D::Item) -> Response<D, EI> { Response::new(self.chatter, Tagged::new(self.tag, message)) }
+  pub fn join(self, message: DI) -> Response<DI, EI> { Response::new(self.chatter, Tagged::new(self.tag, message)) }
 }
 
 struct Channels<T> {

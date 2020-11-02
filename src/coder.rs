@@ -20,7 +20,8 @@ impl<M> Tagged<M> {
 
 pub struct TaggedEncoder<E, EI>
 where
-  E: Encoder<EI>
+  E: Encoder<EI> + 'static + Send,
+  EI: 'static + Send
 {
   e: E,
   _ei: PhantomData<fn() -> EI>
@@ -28,14 +29,16 @@ where
 
 impl<E, EI> TaggedEncoder<E, EI>
 where
-  E: Encoder<EI>
+  E: Encoder<EI> + 'static + Send,
+  EI: 'static + Send
 {
   pub fn new(e: E) -> TaggedEncoder<E, EI> { TaggedEncoder { e, _ei: PhantomData } }
 }
 
 impl<E, EI> Encoder<Tagged<EI>> for TaggedEncoder<E, EI>
 where
-  E: Encoder<EI>
+  E: Encoder<EI> + 'static + Send,
+  EI: 'static + Send
 {
   type Error = E::Error;
 
