@@ -4,7 +4,7 @@
 //!
 //! ```
 //! # use error_chain::bail;
-//! # use futures::executor::block_on;
+//! # use tokio::runtime::Runtime;
 //! # use futures::future::*;
 //! # use futures::future;
 //! # use futures::io::{ReadHalf, WriteHalf, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -18,9 +18,10 @@
 //! # use tokio_test::io::Builder;
 //! # use tokio_util::codec::*;
 //! # use tokio_util::compat::Tokio02AsyncReadCompatExt;
-//! # fn handle_protocol_2(resp: Response<Dec, Message>) -> impl Future<Output = Result<bool>> {
+//! # fn handle_protocol_2(resp: Response<Message, Message>) -> impl Future<Output = Result<bool>> {
 //! #   future::ok(true)
 //! # }
+//! # fn block_on<F: Future>(f: F) -> F::Output { Runtime::new().unwrap().block_on(f) }
 //! # let encoder = Enc::new();
 //! # let decoder = Dec::new();
 //! # let socket = Builder::new()
@@ -72,9 +73,9 @@ use futures::stream::{Stream, StreamExt};
 use log::debug;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tokio::time::{timeout, Duration};
 use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
-use tokio::time::{timeout, Duration};
 
 const ASK_TIMEOUT_SECS: u64 = 5;
 type SporkRead<T, D> = FramedRead<Compat<ReadHalf<T>>, TaggedDecoder<D>>;
@@ -217,7 +218,7 @@ where
   }
 }
 
-fn out_pump<T, E, EI>(write: SporkWrite<T, E, EI>) -> (Sender<Tagged<EI>>, impl Future<Output = Result<()>>)
+fn out_pump<T, E, EI>(write: SporkWrite<T, E, EI>) -> (Sender<Closing<Tagged<EI>>>, impl Future<Output = Result<()>>)
 where
   T: AsyncRead + AsyncWrite + Sized + 'static,
   E: Encoder<EI> + 'static + Send,
@@ -228,7 +229,7 @@ where
   (send, out_loop(write, rcv))
 }
 
-async fn out_loop<T, E, EI>(mut write: SporkWrite<T, E, EI>, mut rcv: Receiver<Tagged<EI>>) -> Result<()>
+async fn out_loop<T, E, EI>(mut write: SporkWrite<T, E, EI>, mut rcv: Receiver<Closing<Tagged<EI>>>) -> Result<()>
 where
   T: AsyncRead + AsyncWrite + Sized + 'static,
   E: Encoder<EI> + 'static + Send,
@@ -236,7 +237,10 @@ where
   EI: 'static + Send
 {
   while let Some(val) = rcv.next().await {
-    write.send(val).await.map_err(|e| e.into())?
+    match val {
+      Closing::Close => rcv.close(),
+      Closing::Item(val) => write.send(val).await.map_err(|e| e.into())?
+    }
   }
   Ok(())
 }
@@ -269,7 +273,7 @@ async fn handle_next<DI: 'static>(
 
 /// A simple message sender/receiver that can initiate conversations from this side of a connection.
 pub struct Chatter<DI, EI> {
-  write: Sender<Tagged<EI>>,
+  write: Sender<Closing<Tagged<EI>>>,
   channels: Channels<DI>
 }
 
@@ -282,7 +286,10 @@ where
   EI: 'static,
   DI: 'static
 {
-  fn new(write: Sender<Tagged<EI>>, channels: Channels<DI>) -> Chatter<DI, EI> { Chatter { write, channels } }
+  fn new(write: Sender<Closing<Tagged<EI>>>, channels: Channels<DI>) -> Chatter<DI, EI> { Chatter { write, channels } }
+
+  /// Close the communication channel.
+  pub async fn close(&mut self) -> Result<()> { Ok(self.write.send(Closing::Close).await?) }
 
   /// Send a message to the server, without expecting a particular response.
   pub fn say<M: Into<EI>>(&mut self, message: M) -> impl Future<Output = Result<()>> + '_ {
@@ -325,7 +332,7 @@ where
   }
 
   async fn say_tagged(&mut self, message: Tagged<EI>) -> Result<()> {
-    Ok(self.write.send(message).await?)
+    Ok(self.write.send(Closing::Item(message)).await?)
   }
 
   fn into_ask_tagged(self, message: Tagged<EI>) -> impl Future<Output = Result<Response<DI, EI>>> {
@@ -345,7 +352,7 @@ where
   }
 
   async fn into_say_tagged(mut self, message: Tagged<EI>) -> Result<()> {
-    Ok(self.write.send(message).await?)
+    Ok(self.write.send(Closing::Item(message)).await?)
   }
 }
 
@@ -368,6 +375,9 @@ where
   pub fn split(self) -> (Responder<DI, EI>, DI) {
     (Responder::new(self.chatter, self.message.tag()), self.message.into_message())
   }
+
+  /// Close communication.
+  pub async fn close(&mut self) -> Result<()> { self.chatter.close().await }
 
   /// Send a message to the server, without expecting a particular response.
   pub fn say<M: Into<EI>>(self, message: M) -> impl Future<Output = Result<()>> {
@@ -407,6 +417,9 @@ where
   EI: 'static
 {
   fn new(chatter: Chatter<DI, EI>, tag: u32) -> Responder<DI, EI> { Responder { chatter, tag } }
+
+  /// Close communication.
+  pub async fn close(&mut self) -> Result<()> { self.chatter.close().await }
 
   /// Get the chatter that originated this response, so that further conversations can be had.
   pub fn chatter(&self) -> Chatter<DI, EI> { self.chatter.clone() }
@@ -469,13 +482,18 @@ impl<T> Channel<T> {
   }
 }
 
+enum Closing<T> {
+  Close,
+  Item(T)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
-  use futures::executor::block_on;
   use futures::future::{try_join, Either};
   use futures::stream::TryStreamExt;
   use message::*;
+  use tokio::runtime::Runtime;
   use tokio_test::io::Builder;
   use tokio_util::compat::Tokio02AsyncReadCompatExt;
 
@@ -487,45 +505,50 @@ mod tests {
     assert_eq!(0, channels.lock().unwrap().len());
   }
 
+  fn block_on<F: Future>(f: F) -> F::Output { Runtime::new().unwrap().block_on(f) }
+
   #[test]
   fn test_chatter_ask() {
     let mut chatter = setup_chatter();
     let channels = chatter.channels.channels.clone();
-    drop(chatter.ask("What is the response?"));
+    drop(block_on(async move { chatter.ask("What is the response?").await }));
     assert_eq!(1, channels.lock().unwrap().len());
   }
 
   #[test]
   fn test_outgoing() {
-    let mocket = Builder::new()
-      .write(b"\x00\x00\x00\x00\x00\x00\x00\x09Sending 1")
-      .read(b"\x00\x00\x00\x00\x00\x00\x00\x05Got 1")
-      .build()
-      .compat();
-    let verification = Arc::new(Mutex::new(Vec::new()));
+    block_on(async move {
+      let mocket = Builder::new()
+        .write(b"\x00\x00\x00\x00\x00\x00\x00\x09Sending 1")
+        .read(b"\x00\x00\x00\x00\x00\x00\x00\x05Got 1")
+        .build()
+        .compat();
+      let verification = Arc::new(Mutex::new(Vec::new()));
 
-    let client = Spork::new("test".into(), mocket, Dec::new(), Enc::new(), true);
-    let (mut client_chat, _, driver, _) = client.process();
+      let client = Spork::new("test".into(), mocket, Dec::new(), Enc::new(), true);
+      let (mut client_chat, _, driver, _) = client.process();
 
-    let channels = client_chat.channels.channels.clone();
-    let client_comm = client_chat
-      .ask("Sending 1")
-      .and_then(|response| {
-        verification.lock().unwrap().push(1);
-        match response.message().text() {
-          "Got 1" => {
-            verification.lock().unwrap().push(2);
-            future::ok(response)
+      let channels = client_chat.channels.channels.clone();
+      let client_comm = client_chat
+        .ask("Sending 1")
+        .and_then(|response| {
+          verification.lock().unwrap().push(1);
+          match response.message().text() {
+            "Got 1" => {
+              verification.lock().unwrap().push(2);
+              future::ok(response)
+            }
+            _ => future::err(bad!("Bad from client."))
           }
-          _ => future::err(bad!("Bad from client."))
-        }
-      })
-      .map_ok(|_| verification.lock().unwrap().push(3));
+        })
+        .map_ok(|_| verification.lock().unwrap().push(3));
 
-    block_on(try_join(client_comm, driver).map(|r| r.map(|_| ()))).unwrap();
-    let verification = verification.lock().unwrap();
-    assert_eq!(verification.as_slice(), &[1, 2, 3]);
-    assert_eq!(0, channels.lock().unwrap().len());
+      try_join(client_comm, driver).map(|r| r.map(|_| ())).await.unwrap();
+
+      let verification = verification.lock().unwrap();
+      assert_eq!(verification.as_slice(), &[1, 2, 3]);
+      assert_eq!(0, channels.lock().unwrap().len());
+    });
   }
 
   #[test]
