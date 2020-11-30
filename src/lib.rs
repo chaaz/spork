@@ -58,7 +58,7 @@
 //! # block_on(try_join(try_join(outgoing, incoming), driver).map(|r| r.map(|_| ()))).unwrap();
 //! ```
 
-mod coder;
+pub mod coder;
 pub mod errors;
 pub mod message;
 
