@@ -65,7 +65,7 @@ impl Decoder for Dec {
         Ok(None)
       } else {
         self.len = None;
-        Ok(Some(Message::new(::std::str::from_utf8(&buf.split_to(len as usize).to_vec()).unwrap())))
+        Ok(Some(Message::new(::std::str::from_utf8(&buf.split_to(len as usize)).unwrap())))
       }
     } else if buf.len() < 4 {
       Ok(None)

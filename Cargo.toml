@@ -1,25 +1,25 @@
 [package]
 name = "spork"
-version = "0.4.2"
+version = "0.5.0"
 authors = ["Charlie Ozinga <ozchaz@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-bytes = "0.5"
+bytes = "1.0.0"
 error-chain = "0.12"
 futures = "0.3"
 log = "0.4"
 
 [dependencies.tokio]
-version = "0.2"
-features = ["tcp"]
+version = "1.22.0"
+features = ["net", "time", "rt-multi-thread"]
 
 [dependencies.tokio-util]
-version = "0.3"
+version = "0.7.4"
 features = ["codec", "compat"]
 
 [dev-dependencies]
-tokio-test = "0.2"
+tokio-test = "0.4.2"
 
 [lib]
 name = "spork"

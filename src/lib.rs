@@ -17,7 +17,7 @@
 //! # use std::io;
 //! # use tokio_test::io::Builder;
 //! # use tokio_util::codec::*;
-//! # use tokio_util::compat::Tokio02AsyncReadCompatExt;
+//! # use tokio_util::compat::TokioAsyncReadCompatExt;
 //! # fn handle_protocol_2(resp: Response<Message, Message>) -> impl Future<Output = Result<bool>> {
 //! #   future::ok(true)
 //! # }
@@ -370,7 +370,7 @@ where
 {
   fn new(chatter: Chatter<DI, EI>, message: Tagged<DI>) -> Response<DI, EI> { Response { chatter, message } }
 
-  pub fn message(&self) -> &DI { &self.message.message() }
+  pub fn message(&self) -> &DI { self.message.message() }
 
   pub fn split(self) -> (Responder<DI, EI>, DI) {
     (Responder::new(self.chatter, self.message.tag()), self.message.into_message())
@@ -495,7 +495,7 @@ mod tests {
   use message::*;
   use tokio::runtime::Runtime;
   use tokio_test::io::Builder;
-  use tokio_util::compat::Tokio02AsyncReadCompatExt;
+  use tokio_util::compat::TokioAsyncReadCompatExt;
 
   #[test]
   fn test_chatter_say() {
@@ -572,7 +572,8 @@ mod tests {
       } else {
         verification.lock().unwrap().push(2);
       }
-      Ok(verification.lock().unwrap().push(3))
+      verification.lock().unwrap().push(3);
+      Ok(())
     };
 
     block_on(try_join(client_comm, driver).map(|r| r.map(|_| ()))).unwrap();

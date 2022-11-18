@@ -12,7 +12,7 @@ error_chain! {
     Num(std::num::ParseIntError);
     Utf(std::str::Utf8Error);
     MpscSend(futures::channel::mpsc::SendError);
-    Elapsed(tokio::time::Elapsed);
+    Elapsed(tokio::time::error::Elapsed);
   }
 }
 
